@@ -5,9 +5,12 @@ Handles document uploads and presigned URL generation.
 
 from datetime import datetime
 from uuid import uuid4
-from fastapi import APIRouter, HTTPException, status
+import asyncio
+from fastapi import APIRouter, HTTPException, status, Request, Depends
 
 from ...db.supabase import db
+from ...services.audit import AuditService
+from ...api.deps import get_client_ip, get_current_admin
 from ...models import (
     DocumentUploadRequest,
     DocumentMetadataCreateRequest,
@@ -19,11 +22,15 @@ from ...models import (
     SupplierStatus,
     DocumentVerificationStatus,
 )
+from ...models.audit import AuditAction, AuditResourceType
 from ...core.storage import storage_service
 from ...core.config import settings
 
 
 router = APIRouter(prefix="/documents", tags=["Documents"])
+
+# Initialize audit service
+audit_service = AuditService()
 
 
 @router.post(
@@ -116,7 +123,7 @@ async def get_upload_url(request: DocumentUploadRequest):
     summary="Confirm document upload",
     description="Confirm that a document was successfully uploaded and save its metadata."
 )
-async def confirm_upload(request: DocumentMetadataCreateRequest):
+async def confirm_upload(request: DocumentMetadataCreateRequest, http_request: Request):
     """
     Confirm document upload and save metadata to database.
     
@@ -181,32 +188,65 @@ async def confirm_upload(request: DocumentMetadataCreateRequest):
             detail="Failed to save document metadata"
         )
     
-    # Send admin notification for new document uploads
-    try:
-        from app.core.email import email_service, EmailTemplate
-        from app.core.config import settings
-        
-        # Check if this is a new document or replacement
-        existing_docs = await db.get_documents_by_supplier(request.supplier_id)
-        doc_count = sum(1 for d in existing_docs if d["document_type"] == request.document_type.value)
-        action = "Replaced" if doc_count > 1 else "Uploaded"
-        
-        await email_service.send_template_email(
-            to_email=settings.ADMIN_EMAIL,
-            template=EmailTemplate.ADMIN_DOCUMENT_UPLOADED,
-            data={
-                "supplier_name": supplier.get("company_name", "Unknown"),
-                "document_type": request.document_type.value.replace("_", " ").title(),
+    # Log document upload to audit trail
+    asyncio.create_task(
+        audit_service.log_action_from_request(
+            request=http_request,
+            action=AuditAction.DOCUMENT_UPLOADED,
+            resource_type=AuditResourceType.DOCUMENT,
+            resource_id=document["id"],
+            resource_name=request.filename,
+            metadata={
+                "document_type": request.document_type.value,
                 "filename": request.filename,
-                "action": action,
-                "uploaded_at": document["uploaded_at"],
+                "file_size": request.file_size,
                 "supplier_id": request.supplier_id,
-                "review_link": f"{settings.FRONTEND_URL}/admin/suppliers/{request.supplier_id}"
-            },
-            to_name="Admin Team"
+                "supplier_name": supplier.get("company_name")
+            }
         )
-    except Exception as e:
-        print(f"Failed to send admin notification: {str(e)}")
+    )
+    
+    # Send real-time in-app notification to admins
+    from ...services.notifications import NotificationService
+    from ...models.notification import RecipientType, NotificationType
+    notification_service = NotificationService(db)
+    
+    async def notify_admins_of_upload():
+        try:
+            # Get all active admins
+            admins = await db.get_all_admins()
+            admin_ids = [admin["id"] for admin in admins if admin.get("is_active", True)]
+            
+            if admin_ids:
+                from ...models.notification import BulkNotificationCreate
+                from uuid import UUID
+                
+                doc_type_display = request.document_type.value.replace('_', ' ').title()
+                
+                bulk_notification = BulkNotificationCreate(
+                    recipient_ids=[UUID(admin_id) for admin_id in admin_ids],
+                    recipient_type=RecipientType.ADMIN,
+                    type=NotificationType.DOCUMENT_UPLOADED,
+                    title="New Document Uploaded",
+                    message=f"{supplier.get('company_name', 'A supplier')} uploaded {doc_type_display}",
+                    action_url=f"/admin/suppliers/{request.supplier_id}",
+                    action_label="Review Document",
+                    resource_type="document",
+                    resource_id=UUID(document["id"]),
+                    metadata={
+                        "document_type": request.document_type.value,
+                        "filename": request.filename,
+                        "supplier_id": request.supplier_id,
+                        "supplier_name": supplier.get("company_name")
+                    },
+                    send_email=False  # Don't spam admins with emails for every upload
+                )
+                
+                await notification_service.create_bulk_notifications(bulk_notification)
+        except Exception as e:
+            print(f"Failed to send document upload notifications: {e}")
+    
+    asyncio.create_task(notify_admins_of_upload())
     
     return document
 
@@ -257,7 +297,11 @@ async def get_document(document_id: str):
     summary="Get download URL",
     description="Get a presigned URL to download a document."
 )
-async def get_download_url(document_id: str):
+async def get_download_url(
+    document_id: str,
+    http_request: Request = None,
+    current_admin: dict = Depends(get_current_admin)
+):
     """Generate a presigned URL for downloading a document."""
     document = await db.get_document_by_id(document_id)
     if not document:
@@ -266,10 +310,31 @@ async def get_download_url(document_id: str):
             detail="Document not found"
         )
     
+    # Get supplier info for audit log
+    supplier = await db.get_supplier_by_id(document["supplier_id"])
+    
     try:
         download_data = storage_service.generate_presigned_download_url(
             file_path=document["s3_key"],
             expires_in=3600,
+        )
+        
+        # Log document download
+        await audit_service.log_action(
+            action=AuditAction.DOCUMENT_DOWNLOADED,
+            resource_type=AuditResourceType.DOCUMENT,
+            user_id=current_admin["id"],
+            user_type="admin",
+            resource_id=document_id,
+            resource_name=document["file_name"],
+            metadata={
+                "document_type": document["document_type"],
+                "file_name": document["file_name"],
+                "content_type": document["content_type"],
+                "supplier_id": document["supplier_id"],
+                "supplier_name": supplier.get("company_name") if supplier else None
+            },
+            ip_address=get_client_ip(http_request) if http_request else None
         )
         
         return PresignedDownloadUrlResponse(
@@ -291,7 +356,11 @@ async def get_download_url(document_id: str):
     summary="Get view URL",
     description="Get a presigned URL to view a document inline (e.g., PDF in browser)."
 )
-async def get_view_url(document_id: str):
+async def get_view_url(
+    document_id: str,
+    http_request: Request = None,
+    current_admin: dict = Depends(get_current_admin)
+):
     """Generate a presigned URL for viewing a document inline."""
     document = await db.get_document_by_id(document_id)
     if not document:
@@ -300,11 +369,32 @@ async def get_view_url(document_id: str):
             detail="Document not found"
         )
     
+    # Get supplier info for audit log
+    supplier = await db.get_supplier_by_id(document["supplier_id"])
+    
     try:
         # Use the same download URL for viewing
         view_data = storage_service.generate_presigned_download_url(
             file_path=document["s3_key"],
             expires_in=3600,
+        )
+        
+        # Log document view
+        await audit_service.log_action(
+            action=AuditAction.DOCUMENT_VIEWED,
+            resource_type=AuditResourceType.DOCUMENT,
+            user_id=current_admin["id"],
+            user_type="admin",
+            resource_id=document_id,
+            resource_name=document["file_name"],
+            metadata={
+                "document_type": document["document_type"],
+                "file_name": document["file_name"],
+                "content_type": document["content_type"],
+                "supplier_id": document["supplier_id"],
+                "supplier_name": supplier.get("company_name") if supplier else None
+            },
+            ip_address=get_client_ip(http_request) if http_request else None
         )
         
         return {
@@ -327,7 +417,11 @@ async def get_view_url(document_id: str):
     summary="Delete document",
     description="Delete a document. Only allowed for applications in INCOMPLETE or NEED_MORE_INFO status."
 )
-async def delete_document(document_id: str):
+async def delete_document(
+    document_id: str,
+    http_request: Request = None,
+    current_admin: dict = Depends(get_current_admin)
+):
     """
     Delete a document from the application.
     
@@ -361,6 +455,24 @@ async def delete_document(document_id: str):
     
     # Delete from database
     await db.delete_document(document_id)
+    
+    # Log document deletion with new audit service
+    await audit_service.log_action(
+        action=AuditAction.DOCUMENT_DELETED,
+        resource_type=AuditResourceType.DOCUMENT,
+        user_id=current_admin["id"],
+        user_type="admin",
+        resource_id=document_id,
+        resource_name=document.get("file_name"),
+        metadata={
+            "document_type": document["document_type"],
+            "file_name": document.get("file_name"),
+            "supplier_id": document["supplier_id"],
+            "supplier_name": supplier.get("company_name"),
+            "deleted_by_admin": True
+        },
+        ip_address=get_client_ip(http_request) if http_request else None
+    )
     
     return SuccessResponse(
         success=True,

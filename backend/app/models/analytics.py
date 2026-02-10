@@ -17,6 +17,17 @@ class DateRangeRequest(BaseModel):
     end_date: Optional[date] = Field(None, description="End date for the report")
 
 
+class SupplierReportFilterRequest(BaseModel):
+    """Request model for supplier report filters."""
+    start_date: Optional[date] = Field(None, description="Start date filter")
+    end_date: Optional[date] = Field(None, description="End date filter")
+    status: Optional[List[SupplierStatus]] = Field(None, description="Filter by supplier status")
+    category: Optional[List[BusinessCategory]] = Field(None, description="Filter by business category")
+    location: Optional[str] = Field(None, description="Filter by location (city or country)")
+    min_years_in_business: Optional[int] = Field(None, description="Minimum years in business")
+    max_years_in_business: Optional[int] = Field(None, description="Maximum years in business")
+
+
 class ExportReportRequest(BaseModel):
     """Request model for exporting reports."""
     report_type: str = Field(..., description="Type of report to export")
@@ -149,6 +160,23 @@ class MonthlyTrendListResponse(BaseModel):
     """Response model for monthly trends."""
     items: List[MonthlyTrendResponse]
     period_months: int
+
+
+class WeeklyTrendResponse(BaseModel):
+    """Response model for weekly trend data."""
+    week_label: str
+    year: int
+    week_number: int
+    week_start: date
+    registrations: int
+    approvals: int
+    rejections: int
+
+
+class WeeklyTrendListResponse(BaseModel):
+    """Response model for weekly trends."""
+    items: List[WeeklyTrendResponse]
+    period_weeks: int
 
 
 class DashboardSummaryResponse(BaseModel):

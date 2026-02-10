@@ -8,9 +8,12 @@ from typing import Optional
 from uuid import uuid4
 import secrets
 import string
-from fastapi import APIRouter, HTTPException, status, Query
+from fastapi import APIRouter, HTTPException, status, Query, Request
 
 from ...db.supabase import db
+from ...services.audit import AuditService
+from ...models.audit import AuditAction, AuditResourceType
+from ...api.deps import get_client_ip
 from ...models import (
     SupplierCreateRequest,
     SupplierUpdateRequest,
@@ -34,6 +37,9 @@ from ...core.config import settings
 
 
 router = APIRouter(prefix="/supplier", tags=["Supplier"])
+
+# Initialize audit service
+audit_service = AuditService()
 
 
 @router.post(
@@ -89,6 +95,20 @@ async def create_supplier(request: SupplierCreateRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create supplier application"
         )
+    
+    # Log supplier creation
+    await audit_service.log_action(
+        action=AuditAction.SUPPLIER_CREATED,
+        resource_type=AuditResourceType.SUPPLIER,
+        user_id=supplier["id"],
+        user_type="vendor",
+        resource_id=supplier["id"],
+        resource_name=supplier["company_name"],
+        metadata={
+            "category": supplier["business_category"],
+            "location": f"{supplier['city']}, {supplier['country']}"
+        }
+    )
     
     # Send admin notification for new registration
     try:
@@ -202,6 +222,21 @@ async def update_supplier(supplier_id: str, request: SupplierUpdateRequest):
             detail="Failed to update supplier application"
         )
     
+    # Log supplier update with changes
+    changes = {field: {"old": supplier.get(field), "new": value} 
+               for field, value in update_data.items() 
+               if field != "updated_at"}
+    
+    await audit_service.log_action(
+        action=AuditAction.SUPPLIER_UPDATED,
+        resource_type=AuditResourceType.SUPPLIER,
+        user_id=supplier_id,
+        user_type="vendor",
+        resource_id=supplier_id,
+        resource_name=updated_supplier.get("company_name") or supplier.get("company_name"),
+        changes=changes
+    )
+    
     return updated_supplier
 
 
@@ -282,9 +317,9 @@ async def submit_supplier_application(supplier_id: str, request: SupplierSubmitR
     
     # Send email notifications
     try:
-        # Notify supplier with portal access credentials
         portal_login_url = f"{settings.FRONTEND_URL}/vendor/login"
         
+        # Notify supplier with portal access credentials
         if vendor_password:
             # Send email with portal credentials
             await email_service.send_email(
@@ -340,9 +375,130 @@ async def submit_supplier_application(supplier_id: str, request: SupplierSubmitR
                 },
                 to_name=supplier["contact_person_name"]
             )
+        
+        # Send consolidated admin notification with all application details
+        documents_list = "\n".join([
+            f"<li><strong>{doc['document_type'].replace('_', ' ').title()}:</strong> {doc['file_name']} (uploaded {doc['uploaded_at']})</li>"
+            for doc in documents
+        ])
+        
+        await email_service.send_email(
+            to_email=settings.ADMIN_EMAIL,
+            subject=f"New Application Submitted - {supplier['company_name']}",
+            html_content=f"""
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                <h2>New Supplier Application Submitted</h2>
+                <p>A supplier has completed and submitted their application for review.</p>
+                
+                <div style="background-color: #f9fafb; padding: 20px; border-radius: 8px; margin: 20px 0;">
+                    <h3 style="margin-top: 0; color: #1f2937;">Company Information</h3>
+                    <table style="width: 100%; border-collapse: collapse;">
+                        <tr>
+                            <td style="padding: 8px 0; font-weight: 600; color: #4b5563;">Company Name:</td>
+                            <td style="padding: 8px 0; color: #1f2937;">{supplier['company_name']}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 8px 0; font-weight: 600; color: #4b5563;">Registration #:</td>
+                            <td style="padding: 8px 0; color: #1f2937;">{supplier.get('registration_number', 'N/A')}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 8px 0; font-weight: 600; color: #4b5563;">Business Category:</td>
+                            <td style="padding: 8px 0; color: #1f2937;">{supplier['category'].replace('_', ' ').title()}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 8px 0; font-weight: 600; color: #4b5563;">Contact Person:</td>
+                            <td style="padding: 8px 0; color: #1f2937;">{supplier['contact_person_name']}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 8px 0; font-weight: 600; color: #4b5563;">Email:</td>
+                            <td style="padding: 8px 0; color: #1f2937;">{supplier['email']}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 8px 0; font-weight: 600; color: #4b5563;">Phone:</td>
+                            <td style="padding: 8px 0; color: #1f2937;">{supplier['phone']}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 8px 0; font-weight: 600; color: #4b5563;">Location:</td>
+                            <td style="padding: 8px 0; color: #1f2937;">{supplier.get('city', 'N/A')}, {supplier.get('country', 'N/A')}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 8px 0; font-weight: 600; color: #4b5563;">Submitted At:</td>
+                            <td style="padding: 8px 0; color: #1f2937;">{update_data['submitted_at']}</td>
+                        </tr>
+                    </table>
+                </div>
+                
+                <div style="background-color: #eff6ff; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #3b82f6;">
+                    <h3 style="margin-top: 0; color: #1e40af;">Uploaded Documents ({len(documents)})</h3>
+                    <ul style="margin: 0; padding-left: 20px; color: #1e3a8a;">
+                        {documents_list}
+                    </ul>
+                </div>
+                
+                <div style="text-align: center; margin: 30px 0;">
+                    <a href="{settings.FRONTEND_URL}/admin/suppliers/{supplier_id}" 
+                       style="display: inline-block; background-color: #2563eb; color: white; padding: 12px 32px; 
+                              text-decoration: none; border-radius: 6px; font-weight: 600;">
+                        Review Application Now
+                    </a>
+                </div>
+                
+                <hr style="margin: 30px 0; border: none; border-top: 1px solid #e5e7eb;">
+                <p style="color: #6b7280; font-size: 12px; text-align: center;">
+                    Application ID: {supplier_id}<br>
+                    Rainbow Tourism Group Procurement System
+                </p>
+            </div>
+            """,
+            to_name="Admin Team"
+        )
+        
     except Exception as e:
         # Log but don't fail the submission
         print(f"Failed to send email notification: {e}")
+    
+    # Send in-app notification to admins
+    from ...services.notifications import NotificationService
+    notification_service = NotificationService(db)
+    
+    try:
+        # Get all active admins
+        admins = await db.get_all_admins()
+        admin_ids = [admin["id"] for admin in admins if admin.get("is_active", True)]
+        
+        if admin_ids:
+            asyncio.create_task(
+                notification_service.notify_admins_application_submitted(
+                    admin_ids=admin_ids,
+                    supplier_id=supplier_id,
+                    supplier_name=supplier["company_name"],
+                    category=supplier["category"],
+                    metadata={
+                        "contact_person": supplier["contact_person_name"],
+                        "email": supplier["email"],
+                        "phone": supplier["phone"],
+                        "registration_number": supplier.get("registration_number"),
+                        "submitted_at": update_data["submitted_at"],
+                        "documents_count": len(documents)
+                    }
+                )
+            )
+    except Exception as e:
+        print(f"Failed to send in-app notifications: {e}")
+    
+    # Log supplier submission
+    await audit_service.log_action(
+        action=AuditAction.SUPPLIER_SUBMITTED,
+        resource_type=AuditResourceType.SUPPLIER,
+        user_id=supplier_id,
+        user_type="vendor",
+        resource_id=supplier_id,
+        resource_name=supplier["company_name"],
+        metadata={
+            "documents_count": len(documents),
+            "submitted_at": update_data["submitted_at"]
+        }
+    )
     
     return SuccessResponse(
         success=True,

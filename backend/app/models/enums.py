@@ -6,6 +6,12 @@ Using string enums for database compatibility.
 from enum import Enum
 
 
+class AdminRole(str, Enum):
+    """Roles for admin users."""
+    SYSTEM_ADMIN = "SYSTEM_ADMIN"
+    PROCUREMENT_MANAGER = "PROCUREMENT_MANAGER"
+
+
 class SupplierStatus(str, Enum):
     """Status lifecycle for supplier applications."""
     INCOMPLETE = "INCOMPLETE"
@@ -54,6 +60,9 @@ class DocumentType(str, Enum):
     ISO_14000 = "ISO_14000"
     INTERNAL_QMS = "INTERNAL_QMS"
     SHEQ_POLICY = "SHEQ_POLICY"
+    
+    # Admin-uploaded documents
+    EVALUATION_FORM = "EVALUATION_FORM"  # Supplier evaluation form uploaded by admin
 
 
 class DocumentVerificationStatus(str, Enum):

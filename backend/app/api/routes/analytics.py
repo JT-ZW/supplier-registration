@@ -5,9 +5,11 @@ These endpoints provide statistics and insights for the admin dashboard.
 
 from datetime import datetime, date
 from typing import Optional
-from fastapi import APIRouter, HTTPException, status, Depends, Query
+from fastapi import APIRouter, HTTPException, status, Depends, Query, Request
 
 from ...db.supabase import db
+from ...services.audit_service import audit_service, AuditAction
+from ...api.deps import get_client_ip
 from ...models import (
     OverviewStatsResponse,
     CategoryStatsResponse,
@@ -23,6 +25,8 @@ from ...models import (
     DashboardSummaryResponse,
     MonthlyTrendResponse,
     MonthlyTrendListResponse,
+    WeeklyTrendResponse,
+    WeeklyTrendListResponse,
     BusinessCategory,
     SupplierStatus,
 )
@@ -38,8 +42,21 @@ router = APIRouter(prefix="/analytics", tags=["Analytics"])
     summary="Get overview statistics",
     description="Get high-level overview statistics for the dashboard."
 )
-async def get_overview_stats(current_admin: dict = Depends(get_current_admin)):
+async def get_overview_stats(
+    http_request: Request = None,
+    current_admin: dict = Depends(get_current_admin)
+):
     """Get overview statistics."""
+    # Log analytics access
+    await audit_service.log_analytics_access(
+        admin_id=current_admin["id"],
+        admin_email=current_admin["email"],
+        action=AuditAction.ANALYTICS_ACCESSED,
+        report_type="overview_stats",
+        details={"endpoint": "/analytics/overview"},
+        ip_address=get_client_ip(http_request) if http_request else None
+    )
+    
     stats = await db.get_overview_stats()
     return OverviewStatsResponse(**stats)
 
@@ -50,8 +67,21 @@ async def get_overview_stats(current_admin: dict = Depends(get_current_admin)):
     summary="Get category statistics",
     description="Get supplier count and breakdown by business category."
 )
-async def get_category_stats(current_admin: dict = Depends(get_current_admin)):
+async def get_category_stats(
+    http_request: Request = None,
+    current_admin: dict = Depends(get_current_admin)
+):
     """Get statistics grouped by business category."""
+    # Log analytics access
+    await audit_service.log_analytics_access(
+        admin_id=current_admin["id"],
+        admin_email=current_admin["email"],
+        action=AuditAction.ANALYTICS_ACCESSED,
+        report_type="category_stats",
+        details={"endpoint": "/analytics/categories"},
+        ip_address=get_client_ip(http_request) if http_request else None
+    )
+    
     data = await db.get_supplier_count_by_category()
     
     # Calculate total for percentage
@@ -80,23 +110,39 @@ async def get_category_stats(current_admin: dict = Depends(get_current_admin)):
     "/locations",
     response_model=LocationStatsListResponse,
     summary="Get location statistics",
-    description="Get supplier count and breakdown by location."
+    description="Get supplier count and breakdown by location (city or country)."
 )
-async def get_location_stats(current_admin: dict = Depends(get_current_admin)):
-    """Get statistics grouped by location."""
-    data = await db.get_location_stats()
+async def get_location_stats(
+    level: str = Query(default="city", regex="^(city|country)$", description="Location level: city or country"),
+    http_request: Request = None,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Get statistics grouped by location (city or country)."""
+    # Log analytics access
+    await audit_service.log_analytics_access(
+        admin_id=current_admin["id"],
+        admin_email=current_admin["email"],
+        action=AuditAction.ANALYTICS_ACCESSED,
+        report_type=f"location_stats_{level}",
+        details={"endpoint": "/analytics/locations", "level": level},
+        ip_address=get_client_ip(http_request) if http_request else None
+    )
     
-    # The function returns location, count, percentage already calculated
+    # Choose the appropriate function based on level
+    if level == "country":
+        data = await db.get_location_stats_by_country()
+    else:
+        data = await db.get_location_stats()
+    
+    # Both functions now return: location, count, approved_count, pending_count, percentage
     items = []
     total_suppliers = 0
     for item in data:
-        # get_location_stats returns: location, count, percentage
-        # We need to query for approved/pending counts separately or adjust the model
         items.append(LocationStatsResponse(
             location=item["location"],
             total_count=item["count"],
-            approved_count=0,  # Not provided by get_location_stats
-            pending_count=0,  # Not provided by get_location_stats
+            approved_count=item["approved_count"],
+            pending_count=item["pending_count"],
             percentage=float(item["percentage"]) if item["percentage"] else 0.0,
         ))
         total_suppliers += item["count"]
@@ -165,8 +211,20 @@ async def get_years_in_business_stats(current_admin: dict = Depends(get_current_
     summary="Get status distribution",
     description="Get count of suppliers by application status."
 )
-async def get_status_distribution(current_admin: dict = Depends(get_current_admin)):
+async def get_status_distribution(
+    http_request: Request = None,
+    current_admin: dict = Depends(get_current_admin)
+):
     """Get distribution of suppliers by status."""
+    # Log analytics access
+    await audit_service.log_analytics_access(
+        admin_id=current_admin["id"],
+        admin_email=current_admin["email"],
+        action=AuditAction.ANALYTICS_ACCESSED,
+        report_type="status_distribution",
+        details={"endpoint": "/analytics/status-distribution"},
+        ip_address=get_client_ip(http_request) if http_request else None
+    )
     data = await db.get_status_distribution()
     
     total = sum(item["count"] for item in data)
@@ -195,9 +253,20 @@ async def get_status_distribution(current_admin: dict = Depends(get_current_admi
 )
 async def get_monthly_trends(
     year: int = Query(default=datetime.now().year, ge=2020, le=2100),
+    http_request: Request = None,
     current_admin: dict = Depends(get_current_admin)
 ):
     """Get monthly trends for a specific year."""
+    # Log analytics access
+    await audit_service.log_analytics_access(
+        admin_id=current_admin["id"],
+        admin_email=current_admin["email"],
+        action=AuditAction.ANALYTICS_ACCESSED,
+        report_type="monthly_trends",
+        details={"endpoint": "/analytics/monthly-trends", "year": year},
+        ip_address=get_client_ip(http_request) if http_request else None
+    )
+    
     # get_monthly_trends uses months_back parameter, not year
     # Calculate months back from current date to the start of the requested year
     current_date = datetime.now()
@@ -225,13 +294,68 @@ async def get_monthly_trends(
 
 
 @router.get(
+    "/weekly-trends",
+    response_model=WeeklyTrendListResponse,
+    summary="Get weekly trends",
+    description="Get weekly registration, approval, and rejection trends."
+)
+async def get_weekly_trends(
+    weeks: int = Query(default=12, ge=1, le=52, description="Number of weeks to look back"),
+    http_request: Request = None,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Get weekly trends for the specified number of weeks."""
+    # Log analytics access
+    await audit_service.log_analytics_access(
+        admin_id=current_admin["id"],
+        admin_email=current_admin["email"],
+        action=AuditAction.ANALYTICS_ACCESSED,
+        report_type="weekly_trends",
+        details={"endpoint": "/analytics/weekly-trends", "weeks": weeks},
+        ip_address=get_client_ip(http_request) if http_request else None
+    )
+    
+    data = await db.get_weekly_trends(weeks)
+    
+    items = []
+    for item in data:
+        items.append(WeeklyTrendResponse(
+            week_label=item["week_label"].strip(),
+            year=item["year"],
+            week_number=item["week_number"],
+            week_start=item["week_start"],
+            registrations=item["submitted"],
+            approvals=item["approved"],
+            rejections=item["rejected"],
+        ))
+    
+    return WeeklyTrendListResponse(
+        items=items,
+        period_weeks=len(items)
+    )
+
+
+@router.get(
     "/dashboard-summary",
     response_model=DashboardSummaryResponse,
     summary="Get complete dashboard summary",
     description="Get all key metrics for the admin dashboard in one call."
 )
-async def get_dashboard_summary(current_admin: dict = Depends(get_current_admin)):
+async def get_dashboard_summary(
+    http_request: Request = None,
+    current_admin: dict = Depends(get_current_admin)
+):
     """Get comprehensive dashboard summary with all key metrics."""
+    # Log analytics access
+    await audit_service.log_analytics_access(
+        admin_id=current_admin["id"],
+        admin_email=current_admin["email"],
+        action=AuditAction.ANALYTICS_ACCESSED,
+        report_type="dashboard_summary",
+        details={"endpoint": "/analytics/dashboard-summary"},
+        ip_address=get_client_ip(http_request) if http_request else None
+    )
+    
     # Get overview stats
     overview_data = await db.get_overview_stats()
     overview = OverviewStatsResponse(**overview_data)

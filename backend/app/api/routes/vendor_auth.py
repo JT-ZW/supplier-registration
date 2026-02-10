@@ -14,6 +14,8 @@ from app.core.security import hash_password, verify_password
 from app.core.config import settings
 from app.db.supabase import db
 from app.core.email import email_service
+from app.services.audit import audit_service
+from app.models.audit import AuditAction, AuditResourceType
 
 router = APIRouter(prefix="/vendor", tags=["vendor-auth"])
 security = HTTPBearer()
@@ -241,6 +243,17 @@ async def vendor_login(credentials: VendorLoginRequest):
     supplier.pop("password_reset_token", None)
     supplier.pop("password_reset_expires", None)
     
+    # Log vendor login
+    await audit_service.log_action(
+        action=AuditAction.VENDOR_LOGIN,
+        resource_type=AuditResourceType.SUPPLIER,
+        user_id=supplier["id"],
+        user_type="vendor",
+        resource_id=supplier["id"],
+        resource_name=supplier.get("company_name"),
+        metadata={"login_at": datetime.utcnow().isoformat()}
+    )
+    
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -390,6 +403,17 @@ async def change_password(
         "updated_at": datetime.utcnow().isoformat()
     }).eq("id", current_vendor["id"]).execute()
     
+    # Log password change
+    await audit_service.log_action(
+        action=AuditAction.VENDOR_PASSWORD_CHANGED,
+        resource_type=AuditResourceType.SUPPLIER,
+        user_id=current_vendor["id"],
+        user_type="vendor",
+        resource_id=current_vendor["id"],
+        resource_name=current_vendor.get("company_name"),
+        metadata={"changed_at": datetime.utcnow().isoformat()}
+    )
+    
     return {"message": "Password changed successfully"}
 
 
@@ -491,7 +515,7 @@ async def submit_application(credentials: HTTPAuthorizationCredentials = Depends
         )
     
     # Validate that profile is complete (basic check)
-    required_fields = ["company_name", "registration_number", "contact_person_name", "email", "phone_number", "business_category"]
+    required_fields = ["company_name", "registration_number", "contact_person_name", "email", "phone", "business_category"]
     missing_fields = [field for field in required_fields if not vendor.get(field)]
     
     if missing_fields:
@@ -509,10 +533,12 @@ async def submit_application(credentials: HTTPAuthorizationCredentials = Depends
         )
     
     # Update status to SUBMITTED and set submitted_at
+    # Note: Remove admin_notes from this update - it's for admin use only
     result = db._client.table("suppliers").update({
         "status": "SUBMITTED",
         "submitted_at": datetime.utcnow().isoformat(),
-        "updated_at": datetime.utcnow().isoformat()
+        "updated_at": datetime.utcnow().isoformat(),
+        "info_request_message": None  # Clear any previous admin requests
     }).eq("id", vendor["id"]).execute()
     
     if not result.data:
@@ -546,6 +572,22 @@ async def submit_application(credentials: HTTPAuthorizationCredentials = Depends
         )
     except Exception as e:
         print(f"Failed to send admin notification: {str(e)}")
+    
+    # Send confirmation email to vendor
+    try:
+        await email_service.send_template_email(
+            to_email=updated_supplier["email"],
+            template=EmailTemplate.SUPPLIER_REGISTRATION_SUBMITTED,
+            data={
+                "supplier_name": updated_supplier["company_name"],
+                "contact_person": updated_supplier.get("contact_person_name", "Vendor"),
+                "supplier_id": updated_supplier["id"]
+            },
+            to_name=updated_supplier.get("contact_person_name", "Vendor")
+        )
+        print(f"Confirmation email sent to vendor: {updated_supplier['email']}")
+    except Exception as e:
+        print(f"Failed to send vendor confirmation email: {str(e)}")
     
     updated_supplier.pop("password_hash", None)
     updated_supplier.pop("password_reset_token", None)

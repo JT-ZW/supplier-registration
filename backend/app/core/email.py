@@ -23,7 +23,10 @@ class EmailTemplate(str, Enum):
     ADMIN_NEW_APPLICATION = "admin_new_application"
     ADMIN_APPLICATION_SUBMITTED = "admin_application_submitted"
     ADMIN_PROFILE_UPDATED = "admin_profile_updated"
+    ADMIN_PROFILE_CHANGE_REQUEST = "admin_profile_change_request"
     ADMIN_DOCUMENT_UPLOADED = "admin_document_uploaded"
+    ADMIN_NEW_MESSAGE = "admin_new_message"
+    VENDOR_MESSAGE_REPLY = "vendor_message_reply"
 
 
 class EmailService:
@@ -161,6 +164,26 @@ class EmailService:
                 <p>Procurement System</p>
                 """
             },
+            EmailTemplate.ADMIN_PROFILE_CHANGE_REQUEST: {
+                "subject": "Profile Change Request - {supplier_name}",
+                "body": """
+                <h2>Profile Change Request Requires Approval</h2>
+                <p>A supplier has submitted a profile change request that requires admin review and approval.</p>
+                <p><strong>Supplier Name:</strong> {supplier_name}</p>
+                <p><strong>Registration Number:</strong> {registration_number}</p>
+                <p><strong>Current Status:</strong> {status}</p>
+                <p><strong>Submitted At:</strong> {submitted_at}</p>
+                <p><strong>Fields Requested for Change:</strong></p>
+                <ul>
+                {field_list}
+                </ul>
+                <p><strong>Application ID:</strong> {supplier_id}</p>
+                <p>Please review the changes as soon as possible.</p>
+                <p><a href="{review_link}" style="display: inline-block; background-color: #2563eb; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Review Profile Changes</a></p>
+                <br>
+                <p>Procurement System</p>
+                """
+            },
             EmailTemplate.ADMIN_DOCUMENT_UPLOADED: {
                 "subject": "New Document Uploaded - {supplier_name}",
                 "body": """
@@ -176,6 +199,41 @@ class EmailService:
                 <p><a href="{review_link}">Review Document</a></p>
                 <br>
                 <p>Procurement System</p>
+                """
+            },
+            EmailTemplate.ADMIN_NEW_MESSAGE: {
+                "subject": "New Message from {supplier_name}",
+                "body": """
+                <h2>New Message Received</h2>
+                <p>You have received a new message from a vendor.</p>
+                <p><strong>From:</strong> {supplier_name}</p>
+                <p><strong>Subject:</strong> {thread_subject}</p>
+                <p><strong>Message Preview:</strong></p>
+                <blockquote style="background-color: #f5f5f5; padding: 15px; border-left: 4px solid #2563eb;">
+                {message_preview}
+                </blockquote>
+                <p><strong>Sent At:</strong> {sent_at}</p>
+                <p><a href="{message_link}" style="display: inline-block; background-color: #2563eb; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">View Full Conversation</a></p>
+                <br>
+                <p>Procurement System</p>
+                """
+            },
+            EmailTemplate.VENDOR_MESSAGE_REPLY: {
+                "subject": "Response to: {thread_subject}",
+                "body": """
+                <h2>You Have a New Reply</h2>
+                <p>Dear {contact_person},</p>
+                <p>The admin has responded to your message.</p>
+                <p><strong>Subject:</strong> {thread_subject}</p>
+                <p><strong>Admin Response:</strong></p>
+                <blockquote style="background-color: #f5f5f5; padding: 15px; border-left: 4px solid #2563eb;">
+                {message_preview}
+                </blockquote>
+                <p><strong>Replied At:</strong> {sent_at}</p>
+                <p><a href="{message_link}" style="display: inline-block; background-color: #2563eb; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">View Full Conversation</a></p>
+                <br>
+                <p>Best regards,</p>
+                <p>The Procurement Team</p>
                 """
             }
         }
