@@ -560,7 +560,7 @@ async def list_vendor_users(
     if category:
         query = query.eq("business_category", category)
     if is_active is not None:
-        query = query.eq("is_active", is_active)
+        query = query.eq("activity_status", "ACTIVE" if is_active else "INACTIVE")
     if search:
         query = query.or_(
             f"company_name.ilike.%{search}%,"

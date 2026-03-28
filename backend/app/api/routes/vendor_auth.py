@@ -3,10 +3,10 @@ Vendor authentication endpoints for supplier portal access.
 """
 
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List
 from fastapi import APIRouter, HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field, model_validator
 import secrets
 import jwt
 
@@ -14,8 +14,10 @@ from app.core.security import hash_password, verify_password
 from app.core.config import settings
 from app.db.supabase import db
 from app.core.email import email_service
+from app.core.cache_invalidation import invalidate_analytics_cache
 from app.services.audit import audit_service
 from app.models.audit import AuditAction, AuditResourceType
+from app.models import BusinessCategory, Gender, KeyPersonRole, compute_business_size, compute_esg_flags
 
 router = APIRouter(prefix="/vendor", tags=["vendor-auth"])
 security = HTTPBearer()
@@ -57,6 +59,111 @@ class ChangePasswordRequest(BaseModel):
     """Change password for logged-in vendor."""
     current_password: str
     new_password: str
+
+
+class DraftKeyPersonRequest(BaseModel):
+    fullName: str = ""
+    gender: Gender = Gender.UNSPECIFIED if hasattr(Gender, "UNSPECIFIED") else Gender.MALE
+    dateOfBirth: Optional[str] = None
+    role: KeyPersonRole = KeyPersonRole.DIRECTOR if hasattr(KeyPersonRole, "DIRECTOR") else KeyPersonRole.CONTACT
+
+class DraftTradeReferenceRequest(BaseModel):
+    companyName: str = ""
+    contactPersonName: str = ""
+    email: str = ""
+    phone: str = ""
+    relationship: str = ""
+    serviceProduct: Optional[str] = None
+    contractStartDate: Optional[str] = None
+    contractEndDate: Optional[str] = None
+    annualSpend: Optional[str] = None
+    permissionGranted: bool = False
+
+class VendorRegistrationDraftUpdateRequest(BaseModel):
+    companyName: str = ""
+    registrationNumber: Optional[str] = None
+    taxId: Optional[str] = None
+    yearsInBusiness: int = 0
+    employeeCount: int = 0
+    website: Optional[str] = None
+    isSmallScaleFarmer: bool = False
+    businessCategories: List[BusinessCategory] = []
+    contactPersonName: str = ""
+    contactPersonTitle: str = ""
+    phone: str = ""
+    streetAddress: str = ""
+    city: str = ""
+    stateProvince: str = ""
+    postalCode: Optional[str] = None
+    country: str = ""
+    keyPersons: List[DraftKeyPersonRequest] = []
+    tradeReferences: List[DraftTradeReferenceRequest] = []
+
+async def _build_registration_draft_response(supplier_id: str) -> dict:
+    supplier = db._client.table("suppliers").select("*").eq("id", supplier_id).single().execute().data
+    categories = await db.get_supplier_categories(supplier_id)
+    key_persons = await db.get_key_persons_by_supplier(supplier_id)
+    trade_refs = await db.get_trade_references_by_supplier(supplier_id)
+
+    business_categories = [item["category"] for item in categories] if categories else [supplier.get("business_category")]
+
+    def _strip_placeholder(val, default=""):
+        if not val:
+            return default
+        if isinstance(val, str):
+            v_upper = val.upper().strip()
+            if v_upper == "PENDING" or v_upper == "PENDING CITY" or v_upper == "ZW":
+                return default
+            if all(c == '0' for c in v_upper) and len(v_upper) > 0:
+                return default
+        return val
+
+    return {
+        "supplierId": supplier_id,
+        "email": supplier.get("email"),
+        "status": supplier.get("status"),
+        "companyName": _strip_placeholder(supplier.get("company_name")),
+        "registrationNumber": _strip_placeholder(supplier.get("registration_number")),
+        "taxId": _strip_placeholder(supplier.get("tax_id")),
+        "yearsInBusiness": supplier.get("years_in_business") if supplier.get("years_in_business") is not None else 0,
+        "employeeCount": supplier.get("employee_count") if supplier.get("employee_count") is not None else 0,
+        "website": _strip_placeholder(supplier.get("website")),
+        "isSmallScaleFarmer": bool(supplier.get("is_small_scale_farmer")),
+        "businessCategories": [cat for cat in business_categories if cat and str(cat).upper() != "SERVICES"],
+        "contactPersonName": _strip_placeholder(supplier.get("contact_person_name")),
+        "contactPersonTitle": _strip_placeholder(supplier.get("contact_person_title")),
+        "phone": _strip_placeholder(supplier.get("phone")),
+        "streetAddress": _strip_placeholder(supplier.get("street_address")),
+        "city": _strip_placeholder(supplier.get("city")),
+        "stateProvince": _strip_placeholder(supplier.get("state_province")),
+        "postalCode": _strip_placeholder(supplier.get("postal_code")),
+        "country": _strip_placeholder(supplier.get("country")),
+        "keyPersons": [
+            {
+                "fullName": person.get("full_name") or "",
+                "gender": person.get("gender") or Gender.MALE.value,
+                "dateOfBirth": person.get("date_of_birth"),
+                "role": person.get("role") or KeyPersonRole.DIRECTOR.value,
+            }
+            for person in key_persons
+        ],
+        "tradeReferences": [
+            {
+                "companyName": reference.get("company_name") or "",
+                "contactPersonName": reference.get("contact_person_name") or "",
+                "email": reference.get("email") or "",
+                "phone": reference.get("phone") or "",
+                "relationship": reference.get("relationship") or "",
+                "serviceProduct": reference.get("service_product") or "",
+                "contractStartDate": reference.get("contract_start_date"),
+                "contractEndDate": reference.get("contract_end_date"),
+                "annualSpend": reference.get("annual_spend") or "",
+                "permissionGranted": bool(reference.get("permission_granted")),
+            }
+            for reference in trade_refs
+        ],
+        "updatedAt": supplier.get("updated_at") or supplier.get("created_at"),
+    }
 
 
 # ============== Helper Functions ==============
@@ -169,6 +276,11 @@ async def vendor_signup(request: VendorSignupRequest):
         "contact_person_name": "Pending",  # Placeholder, updated during registration
         "contact_person_title": "Pending",  # Placeholder, updated during registration
         "phone": "0000000000",  # Placeholder, updated during registration
+        "street_address": "Pending",  # Placeholder, updated during registration
+        "city": "Pending",  # Placeholder, updated during registration
+        "state_province": "Pending",  # Placeholder, updated during registration
+        "postal_code": "0000",  # Placeholder, updated during registration
+        "country": "Pending",  # Placeholder, updated during registration
         "email": request.email,
         "password_hash": hash_password(request.password),
         "status": "INCOMPLETE",  # Will be updated during registration
@@ -185,8 +297,17 @@ async def vendor_signup(request: VendorSignupRequest):
     
     supplier = result.data[0]
     
-    # Create access token
-    access_token = create_vendor_access_token(supplier["id"], supplier["email"])
+    # Log account creation audit action
+    await audit_service.log_action(
+        action=AuditAction.SUPPLIER_CREATED,
+        resource_type=AuditResourceType.SUPPLIER,
+        user_id=supplier["id"],
+        user_type="vendor",
+        resource_id=supplier["id"],
+        resource_name=supplier.get("company_name", "PENDING_VENDOR"),
+        metadata={"email": request.email}
+    )
+
     
     # Remove sensitive data
     supplier.pop("password_hash", None)
@@ -422,7 +543,141 @@ async def get_vendor_profile(current_vendor: dict = Depends(get_current_vendor))
     """
     Get current vendor's profile information.
     """
-    return current_vendor
+    vendor_data = current_vendor.copy()
+    vendor_data.pop("password_hash", None)
+    vendor_data.pop("password_reset_token", None)
+    return vendor_data
+
+
+@router.get("/profile")
+async def get_vendor_profile_alias(current_vendor: dict = Depends(get_current_vendor)):
+    """
+    Get current vendor's profile information (alias for /me).
+    """
+    vendor_data = current_vendor.copy()
+    vendor_data.pop("password_hash", None)
+    vendor_data.pop("password_reset_token", None)
+    return vendor_data
+
+
+@router.get("/registration-draft")
+async def get_registration_draft(current_vendor: dict = Depends(get_current_vendor)):
+    """Get the authenticated vendor's registration draft for autosave/resume."""
+    return await _build_registration_draft_response(current_vendor["id"])
+
+
+@router.put("/registration-draft")
+async def save_registration_draft(
+    request: VendorRegistrationDraftUpdateRequest,
+    current_vendor: dict = Depends(get_current_vendor),
+):
+    """Save the authenticated vendor's registration draft data."""
+    if current_vendor["status"] not in ["INCOMPLETE", "NEED_MORE_INFO"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Registration draft cannot be updated in current status",
+        )
+
+    supplier_id = current_vendor["id"]
+
+    if request.isSmallScaleFarmer:
+        effective_categories = [BusinessCategory.FRESH_FARM_PRODUCE]
+        registration_number = (request.registrationNumber or "N/A").strip() or "N/A"
+        tax_id = (request.taxId or "N/A").strip() or "N/A"
+    else:
+        effective_categories = request.businessCategories or []
+        registration_number = (request.registrationNumber or "").strip()
+        tax_id = (request.taxId or "").strip()
+
+    key_persons_payload = [
+        {
+            "full_name": request.contactPersonName if request.isSmallScaleFarmer else person.fullName,
+            "gender": person.gender.value if hasattr(person.gender, "value") else person.gender,
+            "date_of_birth": person.dateOfBirth,
+            "role": KeyPersonRole.CONTACT.value if request.isSmallScaleFarmer else (person.role.value if hasattr(person.role, "value") else person.role),
+        }
+        for person in request.keyPersons
+    ]
+    esg_flags = compute_esg_flags(key_persons_payload)
+    business_size = compute_business_size(request.employeeCount)
+
+    supplier_update = {
+        "company_name": request.companyName or current_vendor.get("company_name", ""),
+        "business_category": effective_categories[0].value if effective_categories else current_vendor.get("business_category", "Services"),
+        "registration_number": registration_number or current_vendor.get("registration_number", ""),
+        "tax_id": tax_id or current_vendor.get("tax_id", ""),
+        "years_in_business": request.yearsInBusiness or current_vendor.get("years_in_business", 0),
+        "employee_count": request.employeeCount or current_vendor.get("employee_count", 0),
+        "website": request.website or "",
+        "is_small_scale_farmer": request.isSmallScaleFarmer,
+        "contact_person_name": request.contactPersonName or current_vendor.get("contact_person_name", ""),
+        "contact_person_title": request.contactPersonTitle or current_vendor.get("contact_person_title", ""),
+        "phone": request.phone or current_vendor.get("phone", ""),
+        "street_address": request.streetAddress or current_vendor.get("street_address", ""),
+        "city": request.city or current_vendor.get("city", ""),
+        "state_province": request.stateProvince or current_vendor.get("state_province", ""),
+        "postal_code": request.postalCode or "",
+        "country": request.country or current_vendor.get("country", ""),
+        "business_size": business_size.value if business_size else current_vendor.get("business_size"),
+        "esg_women_owned": esg_flags["esg_women_owned"],
+        "esg_youth_owned": esg_flags["esg_youth_owned"],
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+    if current_vendor["status"] == "NEED_MORE_INFO":
+        supplier_update["status"] = "INCOMPLETE"
+        supplier_update["info_request_message"] = None
+
+    updated_supplier = db._client.table("suppliers").update(supplier_update).eq("id", supplier_id).execute()
+    if not updated_supplier.data:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to save registration draft",
+        )
+
+    await db.delete_key_persons_by_supplier(supplier_id)
+    for person in key_persons_payload:
+        await db.create_key_person(
+            {
+                "supplier_id": supplier_id,
+                "full_name": person["full_name"],
+                "gender": person["gender"],
+                "date_of_birth": person["date_of_birth"],
+                "role": person["role"],
+            }
+        )
+
+    await db.delete_trade_references_by_supplier(supplier_id)
+    for reference in request.tradeReferences:
+        await db.create_trade_reference(
+            {
+                "supplier_id": supplier_id,
+                "company_name": reference.companyName,
+                "contact_person_name": reference.contactPersonName,
+                "email": str(reference.email),
+                "phone": reference.phone,
+                "relationship": reference.relationship,
+                "service_product": reference.serviceProduct,
+                "contract_start_date": reference.contractStartDate,
+                "contract_end_date": reference.contractEndDate,
+                "annual_spend": reference.annualSpend,
+                "permission_granted": reference.permissionGranted,
+            }
+        )
+
+    await db.delete_supplier_categories(supplier_id)
+    for category in effective_categories:
+        await db.create_supplier_category(
+            {
+                "supplier_id": supplier_id,
+                "category": category.value,
+                "compliance_status": "PENDING",
+            }
+        )
+
+    await invalidate_analytics_cache(scope="summary")
+
+    return await _build_registration_draft_response(supplier_id)
 
 
 @router.put("/me")
@@ -491,6 +746,84 @@ async def update_vendor_profile(update_data: dict, current_vendor: dict = Depend
             )
         except Exception as e:
             print(f"Failed to send admin notification: {str(e)}")
+
+    await invalidate_analytics_cache(scope="summary")
+    
+    updated_supplier.pop("password_hash", None)
+    updated_supplier.pop("password_reset_token", None)
+    updated_supplier.pop("password_reset_expires", None)
+    
+    return updated_supplier
+
+
+@router.patch("/profile")
+async def update_vendor_profile_alias(update_data: dict, current_vendor: dict = Depends(get_current_vendor)):
+    """
+    Update current vendor's profile information (alias for PUT /me).
+    Allows vendors to update their info when status is NEED_MORE_INFO.
+    """
+    from app.models.supplier import SupplierUpdateRequest
+    
+    # Only allow updates if status is INCOMPLETE or NEED_MORE_INFO
+    if current_vendor["status"] not in ["INCOMPLETE", "NEED_MORE_INFO"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Profile cannot be edited in current status"
+        )
+    
+    # Validate update data
+    try:
+        validated_data = SupplierUpdateRequest(**update_data)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid data: {str(e)}"
+        )
+    
+    # Prepare update dict (exclude None values) - use by_alias=False for database snake_case columns
+    update_dict = {k: v for k, v in validated_data.model_dump(by_alias=False, exclude_none=True).items()}
+    update_dict["updated_at"] = datetime.utcnow().isoformat()
+    
+    # If status was NEED_MORE_INFO, reset to INCOMPLETE so admin can review again
+    if current_vendor["status"] == "NEED_MORE_INFO":
+        update_dict["status"] = "INCOMPLETE"
+        update_dict["info_request_message"] = None
+    
+    # Update supplier
+    result = db._client.table("suppliers").update(update_dict).eq("id", current_vendor["id"]).execute()
+    
+    if not result.data:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update profile"
+        )
+    
+    updated_supplier = result.data[0]
+    
+    # Send admin notification for profile updates if in certain statuses
+    if updated_supplier["status"] in ["NEED_MORE_INFO", "UNDER_REVIEW", "SUBMITTED"]:
+        try:
+            from app.core.email import email_service, EmailTemplate
+            from app.core.config import settings
+            
+            await email_service.send_template_email(
+                to_email=settings.ADMIN_EMAIL,
+                template=EmailTemplate.ADMIN_PROFILE_UPDATED,
+                data={
+                    "supplier_name": updated_supplier["company_name"],
+                    "registration_number": updated_supplier.get("registration_number", "N/A"),
+                    "status": updated_supplier["status"],
+                    "updated_at": updated_supplier["updated_at"],
+                    "supplier_id": updated_supplier["id"],
+                    "affected_statuses": "NEED_MORE_INFO, UNDER_REVIEW, or SUBMITTED",
+                    "review_link": f"{settings.FRONTEND_URL}/admin/suppliers/{updated_supplier['id']}"
+                },
+                to_name="Admin Team"
+            )
+        except Exception as e:
+            print(f"Failed to send admin notification: {str(e)}")
+
+    await invalidate_analytics_cache(scope="summary")
     
     updated_supplier.pop("password_hash", None)
     updated_supplier.pop("password_reset_token", None)
@@ -546,9 +879,20 @@ async def submit_application(credentials: HTTPAuthorizationCredentials = Depends
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to submit application"
         )
-    
+
     updated_supplier = result.data[0]
-    
+
+    # Log submission audit
+    await audit_service.log_action(
+        action=AuditAction.SUPPLIER_SUBMITTED,
+        resource_type=AuditResourceType.SUPPLIER,
+        user_id=vendor["id"],
+        user_type="vendor",
+        resource_id=vendor["id"],
+        resource_name=updated_supplier.get("company_name", vendor.get("company_name")),
+        changes={"status": {"old": vendor["status"], "new": "SUBMITTED"}}
+    )
+
     # Send admin notification email
     try:
         from app.core.email import email_service, EmailTemplate
@@ -588,6 +932,8 @@ async def submit_application(credentials: HTTPAuthorizationCredentials = Depends
         print(f"Confirmation email sent to vendor: {updated_supplier['email']}")
     except Exception as e:
         print(f"Failed to send vendor confirmation email: {str(e)}")
+
+    await invalidate_analytics_cache()
     
     updated_supplier.pop("password_hash", None)
     updated_supplier.pop("password_reset_token", None)
@@ -638,3 +984,5 @@ async def set_initial_password(email: EmailStr, password: str):
     }).eq("id", supplier["id"]).execute()
     
     return {"message": "Password set successfully. You can now login."}
+
+

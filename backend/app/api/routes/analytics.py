@@ -4,6 +4,7 @@ These endpoints provide statistics and insights for the admin dashboard.
 """
 
 from datetime import datetime, date
+import asyncio
 from typing import Optional
 from fastapi import APIRouter, HTTPException, status, Depends, Query, Request
 
@@ -31,9 +32,61 @@ from ...models import (
     SupplierStatus,
 )
 from ...api.deps import get_current_admin
+from ...core.cache import get_response_cache
+from ...core.config import settings
 
 
 router = APIRouter(prefix="/analytics", tags=["Analytics"])
+cache = get_response_cache()
+
+
+def _schedule_analytics_audit(
+    current_admin: dict,
+    report_type: str,
+    endpoint: str,
+    http_request: Optional[Request] = None,
+    extra_details: Optional[dict] = None,
+) -> None:
+    """Fire-and-forget analytics audit so reads are not blocked by write latency."""
+
+    async def _log() -> None:
+        details = {"endpoint": endpoint}
+        if extra_details:
+            details.update(extra_details)
+
+        try:
+            await audit_service.log_analytics_access(
+                admin_id=current_admin["id"],
+                admin_email=current_admin["email"],
+                action=AuditAction.ANALYTICS_ACCESSED,
+                report_type=report_type,
+                details=details,
+                ip_address=get_client_ip(http_request) if http_request else None,
+            )
+        except Exception:
+            # Analytics audit failures must never delay dashboard responses.
+            pass
+
+    asyncio.create_task(_log())
+
+
+def _dashboard_summary_cache_key() -> str:
+    return "analytics:dashboard-summary:v1"
+
+
+def _analytics_cache_key(name: str, **params: Optional[object]) -> str:
+    parts = [f"{k}={params[k]}" for k in sorted(params.keys())]
+    return f"analytics:{name}:v1" + (":" + "|".join(parts) if parts else "")
+
+
+@router.get(
+    "/cache-stats",
+    summary="Get analytics cache stats",
+    description="Return lightweight cache hit/miss and invalidation counters for diagnostics."
+)
+async def get_analytics_cache_stats(current_admin: dict = Depends(get_current_admin)):
+    """Expose analytics cache diagnostics for admins."""
+    return await cache.get_stats()
 
 
 @router.get(
@@ -47,18 +100,21 @@ async def get_overview_stats(
     current_admin: dict = Depends(get_current_admin)
 ):
     """Get overview statistics."""
-    # Log analytics access
-    await audit_service.log_analytics_access(
-        admin_id=current_admin["id"],
-        admin_email=current_admin["email"],
-        action=AuditAction.ANALYTICS_ACCESSED,
-        report_type="overview_stats",
-        details={"endpoint": "/analytics/overview"},
-        ip_address=get_client_ip(http_request) if http_request else None
-    )
-    
+    _schedule_analytics_audit(current_admin, "overview_stats", "/analytics/overview", http_request)
+
+    cache_key = _analytics_cache_key("overview")
+    cached_payload = await cache.get_json(cache_key)
+    if cached_payload is not None:
+        return cached_payload
+
     stats = await db.get_overview_stats()
-    return OverviewStatsResponse(**stats)
+    payload = OverviewStatsResponse(**stats).model_dump(mode="json")
+    await cache.set_json(
+        cache_key,
+        payload,
+        ttl_seconds=settings.ANALYTICS_CACHE_TTL_SECONDS,
+    )
+    return payload
 
 
 @router.get(
@@ -72,16 +128,13 @@ async def get_category_stats(
     current_admin: dict = Depends(get_current_admin)
 ):
     """Get statistics grouped by business category."""
-    # Log analytics access
-    await audit_service.log_analytics_access(
-        admin_id=current_admin["id"],
-        admin_email=current_admin["email"],
-        action=AuditAction.ANALYTICS_ACCESSED,
-        report_type="category_stats",
-        details={"endpoint": "/analytics/categories"},
-        ip_address=get_client_ip(http_request) if http_request else None
-    )
-    
+    _schedule_analytics_audit(current_admin, "category_stats", "/analytics/categories", http_request)
+
+    cache_key = _analytics_cache_key("categories")
+    cached_payload = await cache.get_json(cache_key)
+    if cached_payload is not None:
+        return cached_payload
+
     data = await db.get_supplier_count_by_category()
     
     # Calculate total for percentage
@@ -89,7 +142,11 @@ async def get_category_stats(
     
     items = []
     for item in data:
-        category = BusinessCategory(item["category"])
+        try:
+            category = BusinessCategory(item["category"])
+        except ValueError:
+            # Legacy category value still in DB but removed from the enum — skip gracefully
+            continue
         items.append(CategoryStatsResponse(
             category=category,
             category_display=category.value.replace("_", " ").title(),
@@ -100,10 +157,16 @@ async def get_category_stats(
             percentage=round((item["total_count"] / total * 100), 2) if total > 0 else 0.0,
         ))
     
-    return CategoryStatsListResponse(
+    payload = CategoryStatsListResponse(
         items=items,
         total_suppliers=total
+    ).model_dump(mode="json")
+    await cache.set_json(
+        cache_key,
+        payload,
+        ttl_seconds=settings.ANALYTICS_CACHE_TTL_SECONDS,
     )
+    return payload
 
 
 @router.get(
@@ -118,15 +181,18 @@ async def get_location_stats(
     current_admin: dict = Depends(get_current_admin)
 ):
     """Get statistics grouped by location (city or country)."""
-    # Log analytics access
-    await audit_service.log_analytics_access(
-        admin_id=current_admin["id"],
-        admin_email=current_admin["email"],
-        action=AuditAction.ANALYTICS_ACCESSED,
-        report_type=f"location_stats_{level}",
-        details={"endpoint": "/analytics/locations", "level": level},
-        ip_address=get_client_ip(http_request) if http_request else None
+    _schedule_analytics_audit(
+        current_admin,
+        f"location_stats_{level}",
+        "/analytics/locations",
+        http_request,
+        {"level": level},
     )
+
+    cache_key = _analytics_cache_key("locations", level=level)
+    cached_payload = await cache.get_json(cache_key)
+    if cached_payload is not None:
+        return cached_payload
     
     # Choose the appropriate function based on level
     if level == "country":
@@ -147,10 +213,16 @@ async def get_location_stats(
         ))
         total_suppliers += item["count"]
     
-    return LocationStatsListResponse(
+    payload = LocationStatsListResponse(
         items=items,
         total_suppliers=total_suppliers
+    ).model_dump(mode="json")
+    await cache.set_json(
+        cache_key,
+        payload,
+        ttl_seconds=settings.ANALYTICS_CACHE_TTL_SECONDS,
     )
+    return payload
 
 
 @router.get(
@@ -162,6 +234,11 @@ async def get_location_stats(
 async def get_years_in_business_stats(current_admin: dict = Depends(get_current_admin)):
     """Get statistics grouped by years in business ranges."""
     # Get all suppliers
+    cache_key = _analytics_cache_key("years-in-business")
+    cached_payload = await cache.get_json(cache_key)
+    if cached_payload is not None:
+        return cached_payload
+
     suppliers_result = await db.list_suppliers(
         page=1,
         page_size=10000  # Get all for analysis
@@ -198,11 +275,17 @@ async def get_years_in_business_stats(current_admin: dict = Depends(get_current_
             percentage=round((count / total * 100), 2) if total > 0 else 0.0,
         ))
     
-    return YearsInBusinessListResponse(
+    payload = YearsInBusinessListResponse(
         items=items,
         total_suppliers=total,
         average_years=round(average_years, 1)
+    ).model_dump(mode="json")
+    await cache.set_json(
+        cache_key,
+        payload,
+        ttl_seconds=settings.ANALYTICS_CACHE_TTL_SECONDS,
     )
+    return payload
 
 
 @router.get(
@@ -216,15 +299,13 @@ async def get_status_distribution(
     current_admin: dict = Depends(get_current_admin)
 ):
     """Get distribution of suppliers by status."""
-    # Log analytics access
-    await audit_service.log_analytics_access(
-        admin_id=current_admin["id"],
-        admin_email=current_admin["email"],
-        action=AuditAction.ANALYTICS_ACCESSED,
-        report_type="status_distribution",
-        details={"endpoint": "/analytics/status-distribution"},
-        ip_address=get_client_ip(http_request) if http_request else None
-    )
+    _schedule_analytics_audit(current_admin, "status_distribution", "/analytics/status-distribution", http_request)
+
+    cache_key = _analytics_cache_key("status-distribution")
+    cached_payload = await cache.get_json(cache_key)
+    if cached_payload is not None:
+        return cached_payload
+
     data = await db.get_status_distribution()
     
     total = sum(item["count"] for item in data)
@@ -239,10 +320,16 @@ async def get_status_distribution(
             percentage=round((item["count"] / total * 100), 2) if total > 0 else 0.0,
         ))
     
-    return StatusDistributionListResponse(
+    payload = StatusDistributionListResponse(
         items=items,
         total=total
+    ).model_dump(mode="json")
+    await cache.set_json(
+        cache_key,
+        payload,
+        ttl_seconds=settings.ANALYTICS_CACHE_TTL_SECONDS,
     )
+    return payload
 
 
 @router.get(
@@ -257,15 +344,18 @@ async def get_monthly_trends(
     current_admin: dict = Depends(get_current_admin)
 ):
     """Get monthly trends for a specific year."""
-    # Log analytics access
-    await audit_service.log_analytics_access(
-        admin_id=current_admin["id"],
-        admin_email=current_admin["email"],
-        action=AuditAction.ANALYTICS_ACCESSED,
-        report_type="monthly_trends",
-        details={"endpoint": "/analytics/monthly-trends", "year": year},
-        ip_address=get_client_ip(http_request) if http_request else None
+    _schedule_analytics_audit(
+        current_admin,
+        "monthly_trends",
+        "/analytics/monthly-trends",
+        http_request,
+        {"year": year},
     )
+
+    cache_key = _analytics_cache_key("monthly-trends", year=year)
+    cached_payload = await cache.get_json(cache_key)
+    if cached_payload is not None:
+        return cached_payload
     
     # get_monthly_trends uses months_back parameter, not year
     # Calculate months back from current date to the start of the requested year
@@ -287,10 +377,16 @@ async def get_monthly_trends(
                 rejections=item["rejected"],
             ))
     
-    return MonthlyTrendListResponse(
+    payload = MonthlyTrendListResponse(
         items=items,
         period_months=len(items)
+    ).model_dump(mode="json")
+    await cache.set_json(
+        cache_key,
+        payload,
+        ttl_seconds=settings.ANALYTICS_CACHE_TTL_SECONDS,
     )
+    return payload
 
 
 @router.get(
@@ -305,15 +401,18 @@ async def get_weekly_trends(
     current_admin: dict = Depends(get_current_admin)
 ):
     """Get weekly trends for the specified number of weeks."""
-    # Log analytics access
-    await audit_service.log_analytics_access(
-        admin_id=current_admin["id"],
-        admin_email=current_admin["email"],
-        action=AuditAction.ANALYTICS_ACCESSED,
-        report_type="weekly_trends",
-        details={"endpoint": "/analytics/weekly-trends", "weeks": weeks},
-        ip_address=get_client_ip(http_request) if http_request else None
+    _schedule_analytics_audit(
+        current_admin,
+        "weekly_trends",
+        "/analytics/weekly-trends",
+        http_request,
+        {"weeks": weeks},
     )
+
+    cache_key = _analytics_cache_key("weekly-trends", weeks=weeks)
+    cached_payload = await cache.get_json(cache_key)
+    if cached_payload is not None:
+        return cached_payload
     
     data = await db.get_weekly_trends(weeks)
     
@@ -329,10 +428,16 @@ async def get_weekly_trends(
             rejections=item["rejected"],
         ))
     
-    return WeeklyTrendListResponse(
+    payload = WeeklyTrendListResponse(
         items=items,
         period_weeks=len(items)
+    ).model_dump(mode="json")
+    await cache.set_json(
+        cache_key,
+        payload,
+        ttl_seconds=settings.ANALYTICS_CACHE_TTL_SECONDS,
     )
+    return payload
 
 
 @router.get(
@@ -346,38 +451,76 @@ async def get_dashboard_summary(
     current_admin: dict = Depends(get_current_admin)
 ):
     """Get comprehensive dashboard summary with all key metrics."""
-    # Log analytics access
-    await audit_service.log_analytics_access(
-        admin_id=current_admin["id"],
-        admin_email=current_admin["email"],
-        action=AuditAction.ANALYTICS_ACCESSED,
-        report_type="dashboard_summary",
-        details={"endpoint": "/analytics/dashboard-summary"},
-        ip_address=get_client_ip(http_request) if http_request else None
+    _schedule_analytics_audit(current_admin, "dashboard_summary", "/analytics/dashboard-summary", http_request)
+    
+    cache_key = _dashboard_summary_cache_key()
+    cached_payload = await cache.get_json(cache_key)
+    if cached_payload is not None:
+        return cached_payload
+
+    # Get high-volume dashboard sections in one await to reduce response time.
+    overview_task = db.get_overview_stats()
+    category_task = db.get_supplier_count_by_category()
+    location_task = db.get_location_stats()
+    status_task = db.get_status_distribution()
+    submitted_apps_task = db.list_suppliers(
+        status=SupplierStatus.SUBMITTED.value,
+        category=None,
+        page=1,
+        page_size=5,
+        order_by="submitted_at",
+        ascending=False,
     )
-    
-    # Get overview stats
-    overview_data = await db.get_overview_stats()
+    incomplete_apps_task = db.list_suppliers(
+        status=SupplierStatus.INCOMPLETE.value,
+        category=None,
+        page=1,
+        page_size=5,
+        order_by="created_at",
+        ascending=False,
+    )
+
+    (
+        overview_data,
+        category_data,
+        location_data,
+        status_data,
+        submitted_apps_result,
+        incomplete_apps_result,
+    ) = await asyncio.gather(
+        overview_task,
+        category_task,
+        location_task,
+        status_task,
+        submitted_apps_task,
+        incomplete_apps_task,
+    )
+
     overview = OverviewStatsResponse(**overview_data)
-    
+
     # Get category distribution
-    category_data = await db.get_supplier_count_by_category()
     total_suppliers = sum(item["total_count"] for item in category_data)
-    category_distribution = [
-        CategoryStatsResponse(
-            category=BusinessCategory(item["category"]),
-            category_display=item["category"].replace("_", " ").title(),
-            total_count=item["total_count"],
-            approved_count=item["approved_count"],
-            pending_count=item["pending_count"],
-            rejected_count=item["rejected_count"],
-            percentage=round((item["total_count"] / total_suppliers * 100), 2) if total_suppliers > 0 else 0.0,
+    category_distribution = []
+    for item in category_data[:10]:  # Expand window to get 5 valid after skipping legacy
+        try:
+            cat_enum = BusinessCategory(item["category"])
+        except ValueError:
+            continue  # Legacy value still in DB — skip without crashing
+        category_distribution.append(
+            CategoryStatsResponse(
+                category=cat_enum,
+                category_display=item["category"].replace("_", " ").title(),
+                total_count=item["total_count"],
+                approved_count=item["approved_count"],
+                pending_count=item["pending_count"],
+                rejected_count=item["rejected_count"],
+                percentage=round((item["total_count"] / total_suppliers * 100), 2) if total_suppliers > 0 else 0.0,
+            )
         )
-        for item in category_data[:5]  # Top 5 categories
-    ]
+        if len(category_distribution) == 5:
+            break  # We have our top 5 valid categories
     
     # Get location distribution
-    location_data = await db.get_location_stats()
     location_distribution = [
         LocationStatsResponse(
             location=item["location"],
@@ -390,7 +533,6 @@ async def get_dashboard_summary(
     ]
     
     # Get status distribution
-    status_data = await db.get_status_distribution()
     total = sum(item["count"] for item in status_data)
     status_distribution = [
         StatusDistributionResponse(
@@ -402,20 +544,28 @@ async def get_dashboard_summary(
         for item in status_data
     ]
     
-    # Count pending reviews
+    # Count pending reviews — only SUBMITTED (no admin has opened the application yet)
     pending_reviews = sum(
         item["count"] for item in status_data
-        if item["status"] in ["SUBMITTED", "UNDER_REVIEW"]
+        if item["status"] == "SUBMITTED"
     )
     
-    # Get recent applications (last 10, ordered by created_at or submitted_at)
-    recent_apps_result = await db.list_suppliers(
-        status=None,  # All statuses
-        category=None,
-        page=1,
-        page_size=10,
-    )
-    
+    merged_recent_apps = [
+        *(submitted_apps_result.get("items", []) or []),
+        *(incomplete_apps_result.get("items", []) or []),
+    ]
+
+    def _activity_ts(app: dict) -> datetime:
+        raw = app.get("submitted_at") or app.get("created_at")
+        if not raw:
+            return datetime.min
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except Exception:
+            return datetime.min
+
+    merged_recent_apps.sort(key=_activity_ts, reverse=True)
+
     # Format recent applications for frontend
     recent_applications = [
         {
@@ -426,10 +576,10 @@ async def get_dashboard_summary(
             "createdAt": app["created_at"],
             "submittedAt": app.get("submitted_at"),
         }
-        for app in recent_apps_result.get("items", [])[:10]
+        for app in merged_recent_apps[:10]
     ]
     
-    return DashboardSummaryResponse(
+    response_payload = DashboardSummaryResponse(
         overview=overview,
         category_distribution=category_distribution,
         location_distribution=location_distribution,
@@ -438,4 +588,12 @@ async def get_dashboard_summary(
         recent_registrations=overview_data["applications_this_month"],
         pending_reviews=pending_reviews,
         last_updated=datetime.utcnow(),
+    ).model_dump(mode="json")
+
+    await cache.set_json(
+        cache_key,
+        response_payload,
+        ttl_seconds=settings.ANALYTICS_CACHE_TTL_SECONDS,
     )
+
+    return response_payload

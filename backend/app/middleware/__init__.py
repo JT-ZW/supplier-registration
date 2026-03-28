@@ -3,6 +3,7 @@ Middleware package initialization.
 """
 
 from .security import (
+    RequestTimingMiddleware,
     RateLimitMiddleware,
     SecurityHeadersMiddleware,
     RequestSizeLimitMiddleware,
@@ -10,6 +11,7 @@ from .security import (
 )
 
 __all__ = [
+    "RequestTimingMiddleware",
     "RateLimitMiddleware",
     "SecurityHeadersMiddleware",
     "RequestSizeLimitMiddleware",

@@ -24,6 +24,7 @@ from app.models.audit import AuditAction, AuditResourceType
 from app.core.profile_permissions import validate_field_permissions, separate_changes_by_permission
 from app.core.email import email_service, EmailTemplate
 from app.core.config import settings
+from app.core.cache_invalidation import invalidate_analytics_cache
 import json
 
 router = APIRouter(prefix="/profile-changes", tags=["profile-changes"])
@@ -316,7 +317,7 @@ async def get_pending_profile_changes(
 @router.get("/admin/all", response_model=List[ProfileChangeResponse])
 async def get_all_profile_changes(
     request: Request,
-    status_filter: Optional[str] = Query(None, regex="^(PENDING|APPROVED|REJECTED|CANCELLED)$"),
+    status_filter: Optional[str] = Query(None, pattern="^(PENDING|APPROVED|REJECTED|CANCELLED)$"),
     supplier_id: Optional[UUID4] = None,
     limit: int = Query(100, ge=1, le=500),
     current_admin: dict = Depends(get_current_admin)
@@ -341,6 +342,56 @@ async def get_all_profile_changes(
         )
 
 
+@router.get("/admin/history", response_model=List[ProfileChangeListItem])
+async def get_profile_changes_history(
+    request: Request,
+    status_filter: Optional[str] = Query(None, pattern="^(APPROVED|REJECTED|CANCELLED)$"),
+    limit: int = Query(100, ge=1, le=500),
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Get resolved (non-pending) profile change requests with supplier info (admin view)."""
+    try:
+        query = db.client.table("profile_change_requests")\
+            .select("*, suppliers:supplier_id(company_name, email)")\
+            .neq("status", "PENDING")\
+            .order("updated_at", desc=True)\
+            .limit(limit)
+
+        if status_filter:
+            query = query.eq("status", status_filter)
+
+        result = query.execute()
+
+        if not result.data:
+            return []
+
+        items = []
+        for item in result.data:
+            parsed = parse_json_fields(item)
+            supplier_info = parsed.pop("suppliers", None) or {}
+            items.append(ProfileChangeListItem(
+                id=parsed["id"],
+                supplier_id=parsed["supplier_id"],
+                company_name=supplier_info.get("company_name", "Unknown Vendor"),
+                email=supplier_info.get("email", ""),
+                requested_changes=parsed.get("requested_changes", {}),
+                current_values=parsed.get("current_values", {}),
+                status=parsed["status"],
+                created_at=parsed["created_at"],
+                reviewed_at=parsed.get("reviewed_at"),
+                review_notes=parsed.get("review_notes"),
+                days_pending=None,
+            ))
+
+        return items
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch profile change history: {str(e)}"
+        )
+
+
 @router.get("/admin/{request_id}", response_model=ProfileChangeResponse)
 async def get_profile_change_detail(
     request: Request,
@@ -362,8 +413,15 @@ async def get_profile_change_detail(
             )
         
         parsed_data = parse_json_fields(result.data)
+
+        # Resolve reviewer name
+        if parsed_data.get("reviewed_by"):
+            reviewer = await db.get_admin_by_id(str(parsed_data["reviewed_by"]))
+            if reviewer:
+                parsed_data["reviewed_by_name"] = reviewer.get("full_name") or reviewer.get("name") or reviewer.get("email")
+
         return ProfileChangeResponse(**parsed_data)
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -447,6 +505,8 @@ async def review_profile_change(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail=f"Failed to apply profile changes: {str(e)}"
                 )
+
+            await invalidate_analytics_cache()
         
         # Get supplier info for email
         supplier = await db.get_supplier_by_id(change_request.data["supplier_id"])

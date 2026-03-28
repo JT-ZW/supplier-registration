@@ -124,7 +124,7 @@ class NotificationService:
             .range(offset, offset + limit - 1)
         
         if unread_only:
-            query = query.eq("is_read", False)
+            query = query.eq("is_read", "false")
         
         result = query.execute()
         
@@ -349,9 +349,17 @@ class NotificationService:
                 NotificationType.SUPPLIER_STATUS_CHANGE: EmailTemplate.SUPPLIER_APPROVED,  # Will vary based on status
                 NotificationType.DOCUMENT_VERIFICATION: EmailTemplate.ADMIN_DOCUMENT_UPLOADED,
                 NotificationType.APPLICATION_SUBMITTED: EmailTemplate.ADMIN_APPLICATION_SUBMITTED,
+                NotificationType.DOCUMENT_EXPIRY_WARNING: EmailTemplate.DOCUMENT_EXPIRY_WARNING,
+                NotificationType.DOCUMENT_EXPIRED: EmailTemplate.DOCUMENT_EXPIRED,
             }
             
-            email_template = template_map.get(notification.type)
+            # Allow per-notification template override (e.g. critical vs standard expiry)
+            override = metadata.get("_email_template_override")
+            if override:
+                email_template = EmailTemplate(override)
+            else:
+                email_template = template_map.get(notification.type)
+
             if not email_template:
                 # Send generic notification email
                 await email_service.send_email(
@@ -418,8 +426,10 @@ class NotificationService:
                 "old_status": old_status,
                 "new_status": new_status,
                 "supplier_name": supplier_name,
+                "supplier_id": str(supplier_id),
                 "email": supplier_email,
                 "name": contact_person,
+                "contact_person": contact_person,
                 "comments": comments
             },
             send_email=True
@@ -435,6 +445,15 @@ class NotificationService:
         """Create notification for document verification."""
         status_text = "verified" if verification_status == "verified" else "requires attention"
         
+        full_metadata = {
+            **metadata,
+            "document_type": document_type,
+            "filename": metadata.get("file_name", ""),
+            "action": "verified" if verification_status == "verified" else "rejected",
+            "uploaded_at": datetime.utcnow().isoformat(),
+            "supplier_id": str(supplier_id),
+            "review_link": f"/admin/supplier/{supplier_id}",
+        }
         return await self.create_notification(NotificationCreate(
             recipient_id=supplier_id,
             recipient_type=RecipientType.VENDOR,
@@ -445,7 +464,7 @@ class NotificationService:
             action_label="View Documents",
             resource_type="document",
             resource_id=metadata.get("document_id"),
-            metadata=metadata,
+            metadata=full_metadata,
             send_email=verification_status != "verified"  # Only email if not verified
         ))
     
@@ -458,6 +477,13 @@ class NotificationService:
         metadata: Dict[str, Any]
     ) -> List[NotificationResponse]:
         """Notify all admins of new application submission."""
+        full_metadata = {
+            **metadata,
+            "supplier_name": supplier_name,
+            "category": category,
+            "supplier_id": str(supplier_id),
+            "review_link": f"/admin/supplier/{supplier_id}",
+        }
         bulk_notification = BulkNotificationCreate(
             recipient_ids=admin_ids,
             recipient_type=RecipientType.ADMIN,
@@ -468,11 +494,90 @@ class NotificationService:
             action_label="Review Application",
             resource_type="supplier",
             resource_id=supplier_id,
-            metadata=metadata,
+            metadata=full_metadata,
             send_email=True
         )
         
         return await self.create_bulk_notifications(bulk_notification)
+
+
+    async def notify_document_expiry(
+        self,
+        supplier_id: UUID,
+        supplier_name: str,
+        supplier_email: str,
+        contact_person: str,
+        document_type: str,
+        document_type_label: str,
+        expiry_date: str,
+        days_until_expiry: int,
+    ) -> NotificationResponse:
+        """
+        Create an in-app notification and send an email for a document expiry alert.
+
+        Args:
+            supplier_id: Supplier UUID
+            supplier_name: Company name
+            supplier_email: Supplier contact email
+            contact_person: Contact person name
+            document_type: Raw document type key (e.g. 'TAX_CLEARANCE')
+            document_type_label: Human-readable label (e.g. 'Tax Clearance Certificate')
+            expiry_date: ISO date string of the expiry date (YYYY-MM-DD)
+            days_until_expiry: Number of days until (or past if negative) expiry
+        """
+        from ..core.config import settings as _settings
+
+        portal_url = getattr(_settings, 'FRONTEND_URL', 'https://vendors.rtg.co.zw')
+
+        if days_until_expiry < 0:
+            notif_type = NotificationType.DOCUMENT_EXPIRED
+            title = f"{document_type_label} Has Expired"
+            message = (
+                f"Your {document_type_label} expired on {expiry_date}. "
+                "Please upload a renewed document to clear your compliance flag."
+            )
+            # Select critical email template for expired docs
+            email_tpl = EmailTemplate.DOCUMENT_EXPIRED
+        elif days_until_expiry <= 7:
+            notif_type = NotificationType.DOCUMENT_EXPIRY_WARNING
+            title = f"{document_type_label} Expiring in {days_until_expiry} Day(s)"
+            message = (
+                f"Your {document_type_label} expires on {expiry_date} "
+                f"({days_until_expiry} day(s) remaining). Please upload a renewal urgently."
+            )
+            email_tpl = EmailTemplate.DOCUMENT_EXPIRY_CRITICAL
+        else:
+            notif_type = NotificationType.DOCUMENT_EXPIRY_WARNING
+            title = f"{document_type_label} Expiring in {days_until_expiry} Days"
+            message = (
+                f"Your {document_type_label} expires on {expiry_date} "
+                f"({days_until_expiry} days remaining). Please upload a renewal soon."
+            )
+            email_tpl = EmailTemplate.DOCUMENT_EXPIRY_WARNING
+
+        return await self.create_notification(NotificationCreate(
+            recipient_id=supplier_id,
+            recipient_type=RecipientType.VENDOR,
+            type=notif_type,
+            title=title,
+            message=message,
+            action_url="/vendor/documents",
+            action_label="View Documents",
+            resource_type="document",
+            metadata={
+                "supplier_name": supplier_name,
+                "document_type": document_type,
+                "document_type_label": document_type_label,
+                "expiry_date": expiry_date,
+                "days_until_expiry": days_until_expiry,
+                "email": supplier_email,
+                "name": contact_person,
+                "contact_person": contact_person,
+                "portal_url": portal_url,
+                "_email_template_override": email_tpl.value,
+            },
+            send_email=True,
+        ))
 
 
 def get_notification_service(db: Database = None) -> NotificationService:

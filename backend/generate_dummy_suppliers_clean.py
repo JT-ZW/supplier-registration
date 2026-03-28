@@ -12,17 +12,29 @@ from app.db.supabase import db
 
 # Business categories
 CATEGORIES = [
-    "CONSTRUCTION",
-    "MANUFACTURING", 
-    "FOOD_BEVERAGE",
-    "HEALTHCARE",
-    "IT_SERVICES",
-    "LOGISTICS",
-    "CONSULTING",
-    "CLEANING_SERVICES",
+    "CLEANING_EQUIPMENT_SUPPLIERS",
+    "CONSTRUCTION_CONTRACTORS",
+    "DAIRY_SUPPLIERS",
+    "ELECTRICAL_CONTRACTORS",
+    "ENERGY_SUPPLIERS",
+    "FOOD_BEVERAGE_SUPPLIERS",
+    "FRUIT_VEGETABLE_SUPPLIERS",
+    "FURNITURE_SUPPLIERS",
+    "HOTEL_GUEST_LINEN",
+    "HOTEL_GUEST_AMENITIES",
+    "HOUSEKEEPING_CHEMICALS",
+    "ICT_TECHNOLOGY",
+    "KITCHEN_EQUIPMENT",
+    "LANDSCAPING_GARDENING",
+    "LAUNDRY_SERVICES",
+    "MEAT_SUPPLIERS",
+    "PPE_SUPPLIERS",
+    "PEST_CONTROL",
+    "PLUMBING_CONTRACTORS",
     "SECURITY_SERVICES",
-    "GENERAL_SUPPLIES",
-    "OTHER"
+    "TRANSPORT_LOGISTICS",
+    "WASTE_MANAGEMENT",
+    "ROPE_ACCESS",
 ]
 
 # Supplier statuses
@@ -64,17 +76,29 @@ COMPANY_PREFIXES = [
 ]
 
 COMPANY_TYPES = {
-    "CONSTRUCTION": ["Builders", "Construction", "Engineering", "Contractors", "Projects"],
-    "MANUFACTURING": ["Industries", "Manufacturing", "Producers", "Fabricators", "Works"],
-    "FOOD_BEVERAGE": ["Foods", "Catering", "Supplies", "Provisions", "Beverages"],
-    "HEALTHCARE": ["Medical", "Healthcare", "Clinic", "Pharmacy", "Health Services"],
-    "IT_SERVICES": ["Technologies", "Software", "Systems", "IT Solutions", "Digital"],
-    "LOGISTICS": ["Logistics", "Transport", "Freight", "Couriers", "Delivery"],
-    "CONSULTING": ["Consultants", "Advisory", "Solutions", "Group", "Associates"],
-    "CLEANING_SERVICES": ["Cleaning", "Hygiene", "Maintenance", "Services", "Facilities"],
+    "CLEANING_EQUIPMENT_SUPPLIERS": ["Cleaning Equipment", "Hygiene Supplies", "Janitorial", "Sanitation", "Equipment"],
+    "CONSTRUCTION_CONTRACTORS": ["Builders", "Construction", "Engineering", "Contractors", "Projects"],
+    "DAIRY_SUPPLIERS": ["Dairy", "Milk Suppliers", "Creamery", "Dairy Products", "Fresh Dairy"],
+    "ELECTRICAL_CONTRACTORS": ["Electrical", "Electro", "Power Solutions", "Wiring", "Electrical Contractors"],
+    "ENERGY_SUPPLIERS": ["Energy", "Power", "Solar Solutions", "Renewables", "Utilities"],
+    "FOOD_BEVERAGE_SUPPLIERS": ["Foods", "Catering", "Supplies", "Provisions", "Beverages"],
+    "FRUIT_VEGETABLE_SUPPLIERS": ["Fresh Produce", "Fruits & Veg", "Greens", "Market Produce", "Farm Fresh"],
+    "FURNITURE_SUPPLIERS": ["Furniture", "Interiors", "Furnishings", "Office Furniture", "Decor"],
+    "HOTEL_GUEST_LINEN": ["Linen", "Textiles", "Hospitality Linen", "Bedding", "Linen Supply"],
+    "HOTEL_GUEST_AMENITIES": ["Amenities", "Guest Supplies", "Hospitality Supplies", "Guest Care", "Toiletries"],
+    "HOUSEKEEPING_CHEMICALS": ["Cleaning Chemicals", "Chemical Supplies", "Hygiene Chemicals", "Housekeeping", "Chemicals"],
+    "ICT_TECHNOLOGY": ["Technologies", "Software", "Systems", "IT Solutions", "Digital"],
+    "KITCHEN_EQUIPMENT": ["Kitchen Equipment", "Catering Equipment", "Culinary", "Kitchen Supplies", "Appliances"],
+    "LANDSCAPING_GARDENING": ["Landscaping", "Gardens", "Horticulture", "Green Spaces", "Grounds"],
+    "LAUNDRY_SERVICES": ["Laundry", "Linen Services", "Dry Cleaning", "Washing", "Laundry Solutions"],
+    "MEAT_SUPPLIERS": ["Meats", "Butchery", "Meat Supplies", "Abattoir", "Wholesale Meats"],
+    "PPE_SUPPLIERS": ["PPE", "Safety Equipment", "Protective Gear", "Safety Supplies", "Workwear"],
+    "PEST_CONTROL": ["Pest Control", "Fumigation", "Extermination", "Pest Management", "Hygiene Services"],
+    "PLUMBING_CONTRACTORS": ["Plumbing", "Plumbers", "Piping", "Plumbing Services", "Water Systems"],
     "SECURITY_SERVICES": ["Security", "Guards", "Protection", "SafeGuard", "Sentinel"],
-    "GENERAL_SUPPLIES": ["Traders", "Suppliers", "Merchants", "Distributors", "Wholesale"],
-    "OTHER": ["Enterprises", "Ventures", "Holdings", "Group", "Services"]
+    "TRANSPORT_LOGISTICS": ["Logistics", "Transport", "Freight", "Couriers", "Delivery"],
+    "WASTE_MANAGEMENT": ["Waste Management", "Recycling", "Waste Solutions", "Disposal", "Environmental"],
+    "ROPE_ACCESS": ["Rope Access", "Height Works", "Access Solutions", "Rigging", "Industrial Access"],
 }
 
 COMPANY_SUFFIXES = ["(Pvt) Ltd", "Limited", "Inc", "Enterprises", "Group", "& Co"]

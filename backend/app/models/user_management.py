@@ -20,7 +20,7 @@ class AdminUserCreateRequest(BaseModel):
     phone: Optional[str] = Field(None, max_length=30, description="Phone number")
     department: Optional[str] = Field(None, max_length=100, description="Department")
     position: Optional[str] = Field(None, max_length=100, description="Position/Job title")
-    must_change_password: bool = Field(True, description="Require password change on first login")
+    must_change_password: bool = Field(default=True, description="Require password change on first login")
     
     @field_validator("password")
     @classmethod
@@ -50,7 +50,7 @@ class AdminUserUpdateRequest(BaseModel):
 class AdminPasswordResetRequest(BaseModel):
     """Request model for admin to reset another user's password."""
     new_password: str = Field(..., min_length=8, description="New password")
-    must_change_password: bool = Field(True, description="Require password change on next login")
+    must_change_password: bool = Field(default=True, description="Require password change on next login")
     
     @field_validator("new_password")
     @classmethod
@@ -114,7 +114,7 @@ class VendorUserUpdateRequest(BaseModel):
 class VendorPasswordResetRequest(BaseModel):
     """Request model for admin to reset vendor password."""
     new_password: str = Field(..., min_length=8, description="New password")
-    notify_vendor: bool = Field(True, description="Send email notification to vendor")
+    notify_vendor: bool = Field(default=True, description="Send email notification to vendor")
     
     @field_validator("new_password")
     @classmethod
@@ -164,4 +164,4 @@ class VendorUserListResponse(BaseModel):
 
 class UnlockAccountRequest(BaseModel):
     """Request model for unlocking a locked account."""
-    reset_failed_attempts: bool = Field(True, description="Reset failed login attempts counter")
+    reset_failed_attempts: bool = Field(default=True, description="Reset failed login attempts counter")

@@ -2,11 +2,18 @@
 Document-related Pydantic models for request/response validation.
 """
 
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional, List
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .enums import DocumentType, DocumentVerificationStatus
+from .enums import (
+    DocumentType,
+    DocumentVerificationStatus,
+    EXPIRY_REQUIRED_DOCUMENT_TYPES,
+)
+
+
+EXPIRY_REQUIRED_TYPES = set(EXPIRY_REQUIRED_DOCUMENT_TYPES)
 
 
 # ============== Request Models ==============
@@ -18,6 +25,7 @@ class DocumentUploadRequest(BaseModel):
     filename: str = Field(..., alias="fileName", min_length=1, max_length=255, description="Original filename")
     content_type: str = Field(..., alias="contentType", description="MIME type of the file")
     file_size: int = Field(..., alias="fileSize", gt=0, description="File size in bytes")
+    expiry_date: Optional[date] = Field(None, alias="expiryDate", description="Expiry date as printed on the document (required for regulatory/compliance documents)")
     
     model_config = {"populate_by_name": True}  # Accept both snake_case and camelCase
     
@@ -42,6 +50,13 @@ class DocumentUploadRequest(BaseModel):
             raise ValueError(f"Content type must be one of: {', '.join(allowed_types)}")
         return v
 
+    @model_validator(mode="after")
+    def validate_expiry_date_required(self):
+        """Require expiry date for document types that must be tracked for expiry."""
+        if self.document_type in EXPIRY_REQUIRED_TYPES and self.expiry_date is None:
+            raise ValueError(f"expiryDate is required for document type {self.document_type.value}")
+        return self
+
 
 class DocumentMetadataCreateRequest(BaseModel):
     """Request model for saving document metadata after successful upload."""
@@ -51,14 +66,23 @@ class DocumentMetadataCreateRequest(BaseModel):
     filename: str = Field(..., alias="fileName", description="Original filename")
     file_size: int = Field(..., alias="fileSize", gt=0, description="File size in bytes")
     content_type: str = Field(..., alias="contentType", description="MIME type")
+    expiry_date: Optional[date] = Field(None, alias="expiryDate", description="Expiry date as printed on the document (supplier-entered; confirmed by admin during verification)")
     
     model_config = {"populate_by_name": True}  # Accept both snake_case and camelCase
+
+    @model_validator(mode="after")
+    def validate_expiry_date_required(self):
+        """Require expiry date for document types that must be tracked for expiry."""
+        if self.document_type in EXPIRY_REQUIRED_TYPES and self.expiry_date is None:
+            raise ValueError(f"expiryDate is required for document type {self.document_type.value}")
+        return self
 
 
 class DocumentVerifyRequest(BaseModel):
     """Request model for admin to verify/reject a document."""
     status: DocumentVerificationStatus = Field(..., description="New verification status")
     rejection_reason: Optional[str] = Field(None, max_length=500, description="Reason for rejection if applicable")
+    expiry_date: Optional[date] = Field(None, description="Admin-confirmed expiry date (admin can correct what the supplier entered)")
     
     @field_validator("rejection_reason")
     @classmethod
@@ -100,6 +124,14 @@ class DocumentResponse(BaseModel):
     uploaded_at: datetime
     verified_at: Optional[datetime] = None
     verified_by: Optional[str] = None
+    expiry_date: Optional[date] = None
+    # Archival tracking (for replaced documents)
+    is_archived: bool = Field(False, description="True if this document has been replaced by a newer upload")
+    archived_at: Optional[datetime] = Field(None, description="Timestamp when document was archived")
+    replaced_by: Optional[str] = Field(None, description="ID of the document that replaced this one")
+    # Supplementary document tracking
+    is_supplementary: bool = Field(False, description="True if uploaded post-approval, not part of original registration")
+    added_post_approval_at: Optional[datetime] = Field(None, description="Timestamp of post-approval upload")
     
     model_config = {"from_attributes": True, "populate_by_name": True}
 
@@ -130,3 +162,24 @@ class SupplierDocumentStatusResponse(BaseModel):
     total_uploaded: int
     total_verified: int
     is_complete: bool
+
+
+class AddableDocumentItem(BaseModel):
+    """A single document type that an approved supplier can still add."""
+    document_type: str = Field(..., description="DocumentType enum value")
+    display_name: str = Field(..., description="Human-readable document name")
+    category: str = Field(
+        ...,
+        description="Classification: 'mandatory', 'category_specific', 'sustainability', or 'other'"
+    )
+    is_sustainability: bool = Field(
+        False,
+        description="True if this document contributes to sustainability reporting"
+    )
+
+
+class AddableDocumentsResponse(BaseModel):
+    """Response model listing all document types an approved supplier has not yet uploaded."""
+    supplier_id: str
+    addable_documents: List[AddableDocumentItem]
+    total_addable: int

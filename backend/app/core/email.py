@@ -27,6 +27,13 @@ class EmailTemplate(str, Enum):
     ADMIN_DOCUMENT_UPLOADED = "admin_document_uploaded"
     ADMIN_NEW_MESSAGE = "admin_new_message"
     VENDOR_MESSAGE_REPLY = "vendor_message_reply"
+    DOCUMENT_EXPIRY_WARNING = "document_expiry_warning"
+    DOCUMENT_EXPIRY_CRITICAL = "document_expiry_critical"
+    DOCUMENT_EXPIRED = "document_expired"
+    SUPPLIER_SUSPENDED = "supplier_suspended"
+    ADMIN_SUPPLIER_SUSPENDED = "admin_supplier_suspended"
+    SUPPLIER_RESTORED = "supplier_restored"
+    ADMIN_REGISTERED_SUPPLIER = "admin_registered_supplier"
 
 
 class EmailService:
@@ -59,17 +66,24 @@ class EmailService:
         """
         templates = {
             EmailTemplate.SUPPLIER_REGISTRATION_SUBMITTED: {
-                "subject": "Supplier Registration Received - {supplier_name}",
+                "subject": "Application Submitted Successfully - {supplier_name}",
                 "body": """
-                <h2>Thank you for your registration!</h2>
+                <h2>Application Submitted Successfully!</h2>
                 <p>Dear {contact_person},</p>
-                <p>We have received your supplier registration application for <strong>{supplier_name}</strong>.</p>
-                <p>Your application is now under review. We will notify you once a decision has been made.</p>
+                <p>Thank you for submitting your supplier registration application for <strong>{supplier_name}</strong>.</p>
+                <p>Your application is now under review by our procurement team. We typically review applications within 3-5 business days.</p>
                 <p><strong>Application Reference:</strong> {supplier_id}</p>
-                <p>If you have any questions, please don't hesitate to contact us.</p>
+                <h3>What's Next?</h3>
+                <ul>
+                    <li>Our team will carefully review your application and documents</li>
+                    <li>You'll receive email updates on your application status</li>
+                    <li>You can track your progress in real-time through the <a href="{portal_url}">Vendor Portal</a></li>
+                    <li>We may reach out if additional information is needed</li>
+                </ul>
+                <p>If you have any questions, please don't hesitate to contact us at procurement@rtg.co.zw.</p>
                 <br>
                 <p>Best regards,</p>
-                <p>The Procurement Team</p>
+                <p>The Procurement Team<br>Rainbow Tourism Group</p>
                 """
             },
             EmailTemplate.SUPPLIER_APPROVED: {
@@ -234,6 +248,140 @@ class EmailService:
                 <br>
                 <p>Best regards,</p>
                 <p>The Procurement Team</p>
+                """
+            },
+            EmailTemplate.DOCUMENT_EXPIRY_WARNING: {
+                "subject": "Document Expiring in {days_until_expiry} Days – Action Required",
+                "body": """
+                <h2>Document Expiry Notice</h2>
+                <p>Dear {contact_person},</p>
+                <p>This is a reminder that one of your registered documents is expiring soon.</p>
+                <table style="border-collapse: collapse; width: 100%; margin: 16px 0;">
+                    <tr><td style="padding: 8px; font-weight: bold; color: #374151;">Document</td><td style="padding: 8px;">{document_type_label}</td></tr>
+                    <tr style="background: #f9fafb;"><td style="padding: 8px; font-weight: bold; color: #374151;">Expiry Date</td><td style="padding: 8px; color: #d97706; font-weight: bold;">{expiry_date}</td></tr>
+                    <tr><td style="padding: 8px; font-weight: bold; color: #374151;">Days Remaining</td><td style="padding: 8px; color: #d97706; font-weight: bold;">{days_until_expiry} days</td></tr>
+                    <tr style="background: #f9fafb;"><td style="padding: 8px; font-weight: bold; color: #374151;">Company</td><td style="padding: 8px;">{supplier_name}</td></tr>
+                </table>
+                <p>Please upload a renewed document before it expires to avoid a compliance flag on your account.</p>
+                <p><a href="{portal_url}/vendor/documents" style="display: inline-block; background-color: #2563eb; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Upload Renewed Document</a></p>
+                <br>
+                <p>Best regards,</p>
+                <p>The Procurement Team<br>Rainbow Tourism Group</p>
+                """
+            },
+            EmailTemplate.DOCUMENT_EXPIRY_CRITICAL: {
+                "subject": "URGENT: Document Expiring in {days_until_expiry} Days – Immediate Action Required",
+                "body": """
+                <h2 style="color: #dc2626;">&#9888; Urgent: Document Expiring Soon</h2>
+                <p>Dear {contact_person},</p>
+                <p><strong>Your document is expiring in {days_until_expiry} days.</strong> If not renewed, your supplier account will be placed in <em>Compliance Required</em> status until a valid document is uploaded.</p>
+                <table style="border-collapse: collapse; width: 100%; margin: 16px 0;">
+                    <tr><td style="padding: 8px; font-weight: bold; color: #374151;">Document</td><td style="padding: 8px;">{document_type_label}</td></tr>
+                    <tr style="background: #fff3cd;"><td style="padding: 8px; font-weight: bold; color: #374151;">Expiry Date</td><td style="padding: 8px; color: #dc2626; font-weight: bold;">{expiry_date}</td></tr>
+                    <tr><td style="padding: 8px; font-weight: bold; color: #374151;">Days Remaining</td><td style="padding: 8px; color: #dc2626; font-weight: bold;">{days_until_expiry} days</td></tr>
+                    <tr style="background: #f9fafb;"><td style="padding: 8px; font-weight: bold; color: #374151;">Company</td><td style="padding: 8px;">{supplier_name}</td></tr>
+                </table>
+                <p><a href="{portal_url}/vendor/documents" style="display: inline-block; background-color: #dc2626; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: bold;">Upload Renewed Document Now</a></p>
+                <br>
+                <p>Best regards,</p>
+                <p>The Procurement Team<br>Rainbow Tourism Group</p>
+                """
+            },
+            EmailTemplate.DOCUMENT_EXPIRED: {
+                "subject": "Document Expired – Compliance Action Required",
+                "body": """
+                <h2 style="color: #dc2626;">&#10060; Document Has Expired</h2>
+                <p>Dear {contact_person},</p>
+                <p>A document on your supplier profile has expired. Your account has been flagged as <strong>Compliance Required</strong> and will remain so until a valid replacement is uploaded and verified.</p>
+                <table style="border-collapse: collapse; width: 100%; margin: 16px 0;">
+                    <tr><td style="padding: 8px; font-weight: bold; color: #374151;">Document</td><td style="padding: 8px;">{document_type_label}</td></tr>
+                    <tr style="background: #fee2e2;"><td style="padding: 8px; font-weight: bold; color: #374151;">Expired On</td><td style="padding: 8px; color: #dc2626; font-weight: bold;">{expiry_date}</td></tr>
+                    <tr><td style="padding: 8px; font-weight: bold; color: #374151;">Company</td><td style="padding: 8px;">{supplier_name}</td></tr>
+                </table>
+                <h3>How to Resolve</h3>
+                <ol>
+                    <li>Log in to the Vendor Portal.</li>
+                    <li>Navigate to <strong>My Documents</strong>.</li>
+                    <li>Upload a renewed copy of the expired document.</li>
+                    <li>Our team will verify it and restore your account status.</li>
+                </ol>
+                <p><a href="{portal_url}/vendor/documents" style="display: inline-block; background-color: #dc2626; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: bold;">Upload Renewed Document</a></p>
+                <br>
+                <p>Best regards,</p>
+                <p>The Procurement Team<br>Rainbow Tourism Group</p>
+                """
+            },
+            EmailTemplate.SUPPLIER_SUSPENDED: {
+                "subject": "Account Suspended – Expired Documents Require Immediate Action",
+                "body": """
+                <h2 style="color: #7c3aed;">&#9888; Your Supplier Account Has Been Suspended</h2>
+                <p>Dear {contact_person},</p>
+                <p>Your supplier account for <strong>{supplier_name}</strong> has been <strong style="color: #7c3aed;">suspended</strong> because one or more of your compliance documents have expired and were not replaced within the required timeframe.</p>
+                <div style="background: #f5f3ff; border-left: 4px solid #7c3aed; padding: 12px 16px; margin: 16px 0;">
+                    <strong>Reason:</strong> {suspension_reason}
+                </div>
+                <h3>How to Restore Your Account</h3>
+                <ol>
+                    <li>Log in to the <a href="{portal_url}/vendor/documents">Vendor Portal</a>.</li>
+                    <li>Navigate to <strong>My Documents</strong>.</li>
+                    <li>Upload renewed copies of all expired documents.</li>
+                    <li>Our procurement team will verify your documents.</li>
+                    <li>Once <em>all</em> expired documents are verified as current, your account will be automatically restored to <strong>Approved</strong> status.</li>
+                </ol>
+                <p><a href="{portal_url}/vendor/documents" style="display: inline-block; background-color: #7c3aed; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: bold;">Upload Documents Now</a></p>
+                <br>
+                <p>If you believe this suspension is in error, please contact our procurement team at procurement@rtg.co.zw.</p>
+                <p>Best regards,</p>
+                <p>The Procurement Team<br>Rainbow Tourism Group</p>
+                """
+            },
+            EmailTemplate.ADMIN_SUPPLIER_SUSPENDED: {
+                "subject": "Supplier Auto-Suspended – {supplier_name}",
+                "body": """
+                <h2 style="color: #7c3aed;">Supplier Account Auto-Suspended</h2>
+                <p>The system has automatically suspended a supplier due to unresolved expired documents.</p>
+                <table style="border-collapse: collapse; width: 100%; margin: 16px 0;">
+                    <tr style="background: #f9fafb;"><td style="padding: 8px; font-weight: bold; color: #374151;">Supplier</td><td style="padding: 8px;">{supplier_name}</td></tr>
+                    <tr><td style="padding: 8px; font-weight: bold; color: #374151;">Supplier ID</td><td style="padding: 8px;">{supplier_id}</td></tr>
+                    <tr style="background: #f5f3ff;"><td style="padding: 8px; font-weight: bold; color: #374151;">Reason</td><td style="padding: 8px; color: #7c3aed;">{suspension_reason}</td></tr>
+                </table>
+                <p><a href="{review_link}" style="display: inline-block; background-color: #1d4ed8; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">View Suspended Suppliers</a></p>
+                <br>
+                <p>Procurement System</p>
+                """
+            },
+            EmailTemplate.SUPPLIER_RESTORED: {
+                "subject": "Account Restored – Welcome Back, {supplier_name}",
+                "body": """
+                <h2 style="color: #16a34a;">&#10003; Your Account Has Been Restored</h2>
+                <p>Dear {contact_person},</p>
+                <p>Great news! Your supplier account for <strong>{supplier_name}</strong> has been restored to <strong style="color: #16a34a;">Approved</strong> status.</p>
+                <p>All previously expired documents have been verified as current. You are now an active supplier in the Rainbow Tourism Group procurement system.</p>
+                <p><a href="{portal_url}/vendor/dashboard" style="display: inline-block; background-color: #16a34a; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: bold;">Go to Dashboard</a></p>
+                <br>
+                <p>Thank you for keeping your compliance documents up to date.</p>
+                <p>Best regards,</p>
+                <p>The Procurement Team<br>Rainbow Tourism Group</p>
+                """
+            },
+            EmailTemplate.ADMIN_REGISTERED_SUPPLIER: {
+                "subject": "RTG Vendor Portal – Your Supplier Account Has Been Created",
+                "body": """
+                <h2>Welcome to the Rainbow Tourism Group Vendor Portal</h2>
+                <p>Dear {contact_person},</p>
+                <p>Your supplier account for <strong>{supplier_name}</strong> has been created in the Rainbow Tourism Group procurement system by our admin team on your behalf.</p>
+                <div style="background: #f0f9ff; border-left: 4px solid #2563eb; padding: 16px; margin: 20px 0; border-radius: 4px;">
+                    <h3 style="margin: 0 0 12px 0; color: #1e40af;">Your Login Credentials</h3>
+                    <p style="margin: 4px 0;"><strong>Email:</strong> {email}</p>
+                    <p style="margin: 4px 0;"><strong>Temporary Password:</strong> <code style="background: #e0f2fe; padding: 2px 6px; border-radius: 3px; font-size: 14px;">{temp_password}</code></p>
+                </div>
+                <p><strong>Application Status:</strong> {application_status}</p>
+                <p>Please log in to the Vendor Portal to track your application and manage your documents. We strongly recommend changing your password after your first login.</p>
+                <p><a href="{portal_url}/vendor/login" style="display: inline-block; background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: bold;">Log In to Vendor Portal</a></p>
+                <br>
+                <p>If you have any questions, please contact us at procurement@rtg.co.zw.</p>
+                <p>Best regards,</p>
+                <p>The Procurement Team<br>Rainbow Tourism Group</p>
                 """
             }
         }

@@ -60,3 +60,6 @@ pip-delete-this-directory.txt
 .tmp/
 temp/
 *.tmp
+
+# Docker (keep Dockerfile and .dockerignore in git)
+docker-compose.override.yml

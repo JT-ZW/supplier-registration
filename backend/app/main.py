@@ -8,10 +8,15 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from contextlib import asynccontextmanager
+import asyncio
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 from .core.config import settings
 from .core.logger import logger, log_error
 from .middleware import (
+    RequestTimingMiddleware,
     RateLimitMiddleware,
     SecurityHeadersMiddleware,
     RequestSizeLimitMiddleware,
@@ -31,6 +36,7 @@ from .api.routes import (
     expiry_router,
     profile_changes_router,
     user_management_router,
+    sustainability_router,
 )
 from .models import HealthCheckResponse, ValidationErrorResponse, ErrorResponse
 
@@ -41,15 +47,40 @@ async def lifespan(app: FastAPI):
     Application lifespan handler.
     Runs on startup and shutdown.
     """
-    # Startup
+    # ---------- Startup ----------
     logger.info(f"Starting {settings.APP_NAME}")
     logger.info(f"Environment: {settings.APP_ENV}")
     logger.info(f"API Version: {settings.API_VERSION}")
     logger.info(f"Debug Mode: {settings.DEBUG}")
-    
+
+    # Start document-expiry background scheduler (runs once a day at 08:00).
+    def _run_expiry_job():
+        """Sync wrapper so APScheduler (threaded) can call the async job."""
+        from .services.expiry_service import get_expiry_service
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            service = get_expiry_service()
+            loop.run_until_complete(service.run_daily_expiry_job())
+        except Exception as exc:
+            logger.error("Scheduled expiry job failed: %s", exc)
+        finally:
+            loop.close()
+
+    scheduler = BackgroundScheduler(timezone="Africa/Harare")
+    scheduler.add_job(
+        _run_expiry_job,
+        trigger=CronTrigger(hour=8, minute=0),
+        id="daily_expiry_job",
+        replace_existing=True,
+    )
+    scheduler.start()
+    logger.info("APScheduler started – daily expiry job scheduled at 08:00 (Africa/Harare).")
+
     yield
-    
-    # Shutdown
+
+    # ---------- Shutdown ----------
+    scheduler.shutdown(wait=False)
     logger.info(f"Shutting down {settings.APP_NAME}")
 
 
@@ -68,6 +99,12 @@ app = FastAPI(
 
 # Security Headers Middleware (add first for all responses)
 app.add_middleware(SecurityHeadersMiddleware)
+
+# Request Timing Middleware (logs only slow requests)
+app.add_middleware(
+    RequestTimingMiddleware,
+    slow_threshold_ms=settings.SLOW_REQUEST_THRESHOLD_MS,
+)
 
 # Request Size Limit Middleware (prevent memory exhaustion)
 app.add_middleware(
@@ -267,6 +304,11 @@ app.include_router(
 
 app.include_router(
     user_management_router,
+    prefix=f"/api/{settings.API_VERSION}"
+)
+
+app.include_router(
+    sustainability_router,
     prefix=f"/api/{settings.API_VERSION}"
 )
 

@@ -34,11 +34,12 @@ class ProfileChangeResponse(BaseModel):
     current_values: Dict[str, Any]
     status: str
     reviewed_by: Optional[UUID4] = None
+    reviewed_by_name: Optional[str] = None
     reviewed_at: Optional[datetime] = None
     review_notes: Optional[str] = None
     created_at: datetime
     updated_at: datetime
-    
+
     class Config:
         from_attributes = True
 
@@ -71,7 +72,9 @@ class ProfileChangeListItem(BaseModel):
     status: str
     created_at: datetime
     days_pending: Optional[int] = None
-    
+    reviewed_at: Optional[datetime] = None
+    review_notes: Optional[str] = None
+
     class Config:
         from_attributes = True
 

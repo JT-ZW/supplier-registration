@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Documentation
+*.md
+!README.md
+
+# Scripts (testing/setup)
+test_*.py
+check_*.py
+generate_*.py
+apply_*.py
+fix_*.py
+find_*.py
+get_*.py
+reset_*.py
+run_*.py
+*.sql
+
+# Git
+.git/
+.gitignore

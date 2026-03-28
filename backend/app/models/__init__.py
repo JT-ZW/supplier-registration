@@ -10,9 +10,34 @@ from .enums import (
     DocumentVerificationStatus,
     AdminAction,
     AdminRole,
+    # New enums
+    SupplierType,
+    BusinessSize,
+    Gender,
+    KeyPersonRole,
+    ComplianceLevel,
+    LandProofType,
+    # Document lists
     MANDATORY_DOCUMENTS,
+    LOCAL_MANDATORY_DOCUMENTS,
+    FOREIGN_MANDATORY_DOCUMENTS,
+    FARMER_MANDATORY_DOCUMENTS,
     CATEGORY_DOCUMENTS,
+    SUSTAINABILITY_DOCUMENTS,
+    EXPIRY_REQUIRED_DOCUMENT_TYPES,
+    NO_EXPIRY_DOCUMENT_TYPES,
+    LEGACY_CATEGORIES,
+    # Cert group structure
+    CertGroup,
+    CERT_GROUPS_BY_CATEGORY,
+    # Helpers
     get_required_documents,
+    get_sustainability_documents,
+    get_supplier_type,
+    get_statutory_documents,
+    compute_business_size,
+    compute_esg_flags,
+    compute_compliance_level,
 )
 
 from .audit import (
@@ -43,6 +68,7 @@ from .supplier import (
     SupplierCreateRequest,
     SupplierUpdateRequest,
     SupplierSubmitRequest,
+    AdminRegisterSupplierRequest,
     SupplierResponse,
     SupplierListResponse,
     RequiredDocumentsResponse,
@@ -58,6 +84,8 @@ from .document import (
     DocumentListResponse,
     DocumentUploadStatusResponse,
     SupplierDocumentStatusResponse,
+    AddableDocumentItem,
+    AddableDocumentsResponse,
 )
 
 from .admin import (
@@ -157,7 +185,9 @@ __all__ = [
     "AdminRole",
     "MANDATORY_DOCUMENTS",
     "CATEGORY_DOCUMENTS",
+    "SUSTAINABILITY_DOCUMENTS",
     "get_required_documents",
+    "get_sustainability_documents",
     
     # Supplier models
     "SupplierCreateRequest",
@@ -177,6 +207,8 @@ __all__ = [
     "DocumentListResponse",
     "DocumentUploadStatusResponse",
     "SupplierDocumentStatusResponse",
+    "AddableDocumentItem",
+    "AddableDocumentsResponse",
     
     # Admin models
     "AdminLoginRequest",

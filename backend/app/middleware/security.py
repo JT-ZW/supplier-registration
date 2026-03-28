@@ -11,6 +11,40 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 
 from ..core.logger import logger, log_security_event
+from ..core.config import settings
+
+
+class RequestTimingMiddleware(BaseHTTPMiddleware):
+    """Capture request latency and log only slow requests."""
+
+    def __init__(self, app: ASGIApp, slow_threshold_ms: int = 800):
+        super().__init__(app)
+        self.slow_threshold_ms = slow_threshold_ms
+
+    async def dispatch(self, request: Request, call_next):
+        start = time.perf_counter()
+        response = await call_next(request)
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+
+        response.headers["X-Response-Time-Ms"] = str(elapsed_ms)
+
+        if elapsed_ms >= self.slow_threshold_ms:
+            logger.warning(
+                "Slow request detected: %s %s (%d ms)",
+                request.method,
+                request.url.path,
+                elapsed_ms,
+                extra={
+                    "path": request.url.path,
+                    "method": request.method,
+                    "response_time_ms": elapsed_ms,
+                    "slow_threshold_ms": self.slow_threshold_ms,
+                    "client_ip": request.client.host if request.client else None,
+                    "app_env": settings.APP_ENV,
+                },
+            )
+
+        return response
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -176,7 +210,17 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             )
         
         # Process request
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            logger.error(
+                f"Unhandled error in route {request.method} {request.url.path}: {exc}",
+                exc_info=True
+            )
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content={"error": "An unexpected error occurred. Please try again later."},
+            )
         
         # Add rate limit headers to response
         for key, value in headers.items():
@@ -194,7 +238,17 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     
     async def dispatch(self, request: Request, call_next):
         """Add security headers to response."""
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            logger.error(
+                f"Unhandled error in route {request.method} {request.url.path}: {exc}",
+                exc_info=True
+            )
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content={"error": "An unexpected error occurred. Please try again later."},
+            )
         
         # Prevent clickjacking
         response.headers["X-Frame-Options"] = "DENY"
@@ -356,16 +410,39 @@ class AccountLockoutMiddleware(BaseHTTPMiddleware):
         """Process request through account lockout middleware."""
         # Only check login endpoints
         if "/login" not in request.url.path.lower():
-            return await call_next(request)
+            try:
+                return await call_next(request)
+            except RuntimeError as exc:
+                # Starlette can raise this when the client disconnects mid-flight.
+                # Avoid bubbling noisy stack traces for this benign case.
+                if str(exc) == "No response returned." and await request.is_disconnected():
+                    logger.info(
+                        "Client disconnected before response: %s %s",
+                        request.method,
+                        request.url.path,
+                    )
+                    return JSONResponse(status_code=499, content={"detail": "Client Closed Request"})
+                raise
         
         # For login endpoints, the actual lockout check happens in the route handler
         # This middleware just provides the infrastructure
         
-        return await call_next(request)
+        try:
+            return await call_next(request)
+        except RuntimeError as exc:
+            if str(exc) == "No response returned." and await request.is_disconnected():
+                logger.info(
+                    "Client disconnected before response: %s %s",
+                    request.method,
+                    request.url.path,
+                )
+                return JSONResponse(status_code=499, content={"detail": "Client Closed Request"})
+            raise
 
 
 # Export middleware classes
 __all__ = [
+    "RequestTimingMiddleware",
     "RateLimitMiddleware",
     "SecurityHeadersMiddleware",
     "RequestSizeLimitMiddleware",

@@ -15,6 +15,7 @@ from .timeline import router as timeline_router
 from .expiry import router as expiry_router
 from .profile_changes import router as profile_changes_router
 from .user_management import router as user_management_router
+from .sustainability import router as sustainability_router
 
 __all__ = [
     "supplier_router",
@@ -30,4 +31,5 @@ __all__ = [
     "expiry_router",
     "profile_changes_router",
     "user_management_router",
+    "sustainability_router",
 ]

@@ -2,6 +2,8 @@
 API dependencies for authentication and common utilities.
 """
 
+import asyncio
+import time
 from typing import Optional
 from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -13,6 +15,32 @@ from ..models import AdminResponse, AdminRole
 
 # HTTP Bearer token security scheme
 security = HTTPBearer()
+
+
+# Short-lived in-process admin cache to reduce repetitive auth lookups
+# when the dashboard fires several concurrent requests.
+_ADMIN_CACHE_TTL_SECONDS = 15
+_admin_cache_lock = asyncio.Lock()
+_admin_cache: dict[str, tuple[float, dict]] = {}
+
+
+async def _get_cached_admin(admin_id: str) -> Optional[dict]:
+    async with _admin_cache_lock:
+        cached = _admin_cache.get(admin_id)
+        if not cached:
+            return None
+
+        expires_at, admin = cached
+        if time.time() >= expires_at:
+            _admin_cache.pop(admin_id, None)
+            return None
+
+        return admin
+
+
+async def _set_cached_admin(admin_id: str, admin: dict) -> None:
+    async with _admin_cache_lock:
+        _admin_cache[admin_id] = (time.time() + _ADMIN_CACHE_TTL_SECONDS, admin)
 
 
 async def get_current_admin(
@@ -48,7 +76,12 @@ async def get_current_admin(
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    admin = await db.get_admin_by_id(admin_id)
+    admin = await _get_cached_admin(admin_id)
+    if admin is None:
+        admin = await db.get_admin_by_id(admin_id)
+        if admin:
+            await _set_cached_admin(admin_id, admin)
+
     if not admin:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -209,7 +242,9 @@ class FilterParams:
         phone: Optional[str] = None,
         city: Optional[str] = None,
         country: Optional[str] = None,
-        sort_by: str = "created_at",
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        sort_by: str = "submitted_at",
         sort_order: str = "desc"
     ):
         self.search = search
@@ -223,10 +258,56 @@ class FilterParams:
         self.phone = phone
         self.city = city
         self.country = country
+        self.date_from = date_from
+        self.date_to = date_to
         self.sort_by = sort_by
         self.sort_order = sort_order
         self.ascending = sort_order.lower() == "asc"
 
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+) -> dict:
+    """
+    Dependency to get either an admin or vendor user.
+    """
+    token = credentials.credentials
+    payload = verify_access_token(token)
+
+    if payload is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token payload",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Note: Because both IDs are UUIDs, we check admin first, then vendor.
+    admin = await db.get_admin_by_id(user_id)
+    if admin:
+        if not admin.get("is_active", True):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Admin account is deactivated",
+            )
+        return {"type": "admin", "data": admin}
+
+    supplier = await db.get_supplier_by_id(user_id)
+    if supplier:
+        return {"type": "vendor", "data": supplier}
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="User not found",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 def get_client_ip(request: Request) -> Optional[str]:
     """
@@ -255,3 +336,4 @@ def get_client_ip(request: Request) -> Optional[str]:
         return request.client.host
     
     return None
+

@@ -3,7 +3,7 @@ Application configuration settings.
 Uses pydantic-settings for type-safe environment variable handling.
 """
 
-from typing import List
+from typing import List, Optional
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 
@@ -32,9 +32,9 @@ class Settings(BaseSettings):
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     
-    # AWS S3
-    AWS_ACCESS_KEY_ID: str
-    AWS_SECRET_ACCESS_KEY: str
+    # AWS S3 (Optional - Using Supabase Storage as primary)
+    AWS_ACCESS_KEY_ID: Optional[str] = None
+    AWS_SECRET_ACCESS_KEY: Optional[str] = None
     AWS_REGION: str = "us-east-1"
     S3_BUCKET_NAME: str = "supplier-documents"
     S3_PRESIGNED_URL_EXPIRY: int = 600  # 10 minutes
@@ -54,7 +54,7 @@ class Settings(BaseSettings):
         return self.MAX_FILE_SIZE_MB * 1024 * 1024
     
     # Email (SendGrid)
-    SENDGRID_API_KEY: str = ""
+    SENDGRID_API_KEY: Optional[str] = None
     FROM_EMAIL: str = "noreply@yourcompany.com"
     FROM_NAME: str = "Supplier Registration System"
     ADMIN_EMAIL: str = "admin@yourcompany.com"  # Admin email for notifications
@@ -62,11 +62,16 @@ class Settings(BaseSettings):
     # Email (SMTP Alternative)
     SMTP_HOST: str = "smtp.gmail.com"
     SMTP_PORT: int = 587
-    SMTP_USERNAME: str = ""
-    SMTP_PASSWORD: str = ""
+    SMTP_USERNAME: Optional[str] = None
+    SMTP_PASSWORD: Optional[str] = None
     
     # Frontend URL
     FRONTEND_URL: str = "http://localhost:3000"
+
+    # Performance and caching
+    REDIS_URL: Optional[str] = None
+    ANALYTICS_CACHE_TTL_SECONDS: int = 45
+    SLOW_REQUEST_THRESHOLD_MS: int = 800
     
     # Data Retention
     REJECTED_APPLICATION_RETENTION_DAYS: int = 30

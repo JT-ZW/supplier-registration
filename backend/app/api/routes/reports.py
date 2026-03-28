@@ -32,6 +32,11 @@ async def download_supplier_pdf_report(
     location: Optional[str] = Query(None, description="Filter by location (city or country)"),
     min_years_in_business: Optional[int] = Query(None, ge=0, description="Minimum years in business"),
     max_years_in_business: Optional[int] = Query(None, ge=0, description="Maximum years in business"),
+    sort_by: str = Query("company_name", description="Sort field: company_name, category_then_company, business_category, status, submitted_at"),
+    sort_order: str = Query("asc", description="Sort direction: asc or desc"),
+    include_summary: bool = Query(True, description="Include Report Summary section"),
+    include_sustainability: bool = Query(True, description="Include Sustainability section"),
+    include_supplier_list: bool = Query(True, description="Include Supplier List section"),
     current_admin: dict = Depends(get_current_admin)
 ):
     """
@@ -52,6 +57,11 @@ async def download_supplier_pdf_report(
             location=location,
             min_years=min_years_in_business,
             max_years=max_years_in_business,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            include_summary=include_summary,
+            include_sustainability=include_sustainability,
+            include_supplier_list=include_supplier_list,
         )
         
         # Generate filename
@@ -69,6 +79,9 @@ async def download_supplier_pdf_report(
         )
         
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"PDF REPORT ERROR:\n{tb}")
         raise HTTPException(
             status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate PDF report: {str(e)}"
@@ -88,6 +101,11 @@ async def download_supplier_excel_report(
     location: Optional[str] = Query(None, description="Filter by location (city or country)"),
     min_years_in_business: Optional[int] = Query(None, ge=0, description="Minimum years in business"),
     max_years_in_business: Optional[int] = Query(None, ge=0, description="Maximum years in business"),
+    sort_by: str = Query("company_name", description="Sort field: company_name, category_then_company, business_category, status, submitted_at"),
+    sort_order: str = Query("asc", description="Sort direction: asc or desc"),
+    include_summary: bool = Query(True, description="Include Summary sheet"),
+    include_sustainability: bool = Query(True, description="Include Sustainability sheet"),
+    include_supplier_list: bool = Query(True, description="Include Supplier Details sheet"),
     current_admin: dict = Depends(get_current_admin)
 ):
     """
@@ -107,6 +125,11 @@ async def download_supplier_excel_report(
             location=location,
             min_years=min_years_in_business,
             max_years=max_years_in_business,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            include_summary=include_summary,
+            include_sustainability=include_sustainability,
+            include_supplier_list=include_supplier_list,
         )
         
         # Generate filename
@@ -144,6 +167,8 @@ async def preview_supplier_report(
     min_years_in_business: Optional[int] = Query(None, ge=0, description="Minimum years in business"),
     max_years_in_business: Optional[int] = Query(None, ge=0, description="Maximum years in business"),
     limit: int = Query(10, ge=1, le=100, description="Number of records to preview"),
+    sort_by: str = Query("company_name", description="Sort field: company_name, category_then_company, business_category, status, submitted_at"),
+    sort_order: str = Query("asc", description="Sort direction: asc or desc"),
     current_admin: dict = Depends(get_current_admin)
 ):
     """
@@ -161,6 +186,8 @@ async def preview_supplier_report(
             location=location,
             min_years=min_years_in_business,
             max_years=max_years_in_business,
+            sort_by=sort_by,
+            sort_order=sort_order,
         )
         
         # Calculate statistics
@@ -171,7 +198,7 @@ async def preview_supplier_report(
         
         for supplier in suppliers:
             s = supplier.get('status', 'Unknown')
-            c = supplier.get('category', 'Unknown')
+            c = supplier.get('business_category', 'Unknown')
             
             status_counts[s] = status_counts.get(s, 0) + 1
             category_counts[c] = category_counts.get(c, 0) + 1

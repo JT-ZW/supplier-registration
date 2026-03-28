@@ -8,12 +8,13 @@ from typing import Optional
 from uuid import uuid4
 import secrets
 import string
-from fastapi import APIRouter, HTTPException, status, Query, Request
+import asyncio
+from fastapi import APIRouter, HTTPException, status, Query, Request, Depends
 
 from ...db.supabase import db
 from ...services.audit import AuditService
 from ...models.audit import AuditAction, AuditResourceType
-from ...api.deps import get_client_ip
+from ...api.deps import get_client_ip, get_current_user
 from ...models import (
     SupplierCreateRequest,
     SupplierUpdateRequest,
@@ -30,10 +31,29 @@ from ...models import (
     MANDATORY_DOCUMENTS,
     CATEGORY_DOCUMENTS,
     get_required_documents,
+    SupplierType,
+    get_supplier_type,
+    get_statutory_documents,
+    compute_business_size,
+    compute_esg_flags,
+    CERT_GROUPS_BY_CATEGORY,
+    LEGACY_CATEGORIES,
+)
+from ...models.compliance import (
+    KeyPersonRequest,
+    KeyPersonResponse,
+    KeyPersonListResponse,
+    FarmerApplicationFormRequest,
+    FarmerApplicationFormResponse,
+    SupplierCategoryRequest,
+    SupplierCategoryResponse,
+    SupplierCategoryListResponse,
+    CategoryRequirementsResponse,
 )
 from ...core.email import email_service, EmailTemplate
 from ...core.security import hash_password
 from ...core.config import settings
+from ...core.cache_invalidation import invalidate_analytics_cache
 
 
 router = APIRouter(prefix="/supplier", tags=["Supplier"])
@@ -64,16 +84,56 @@ async def create_supplier(request: SupplierCreateRequest):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="A supplier with this email address already exists"
         )
-    
+
+    # Derive supplier type and ESG flags from the request data
+    supplier_type = get_supplier_type(request.country, request.is_small_scale_farmer)
+    if request.is_small_scale_farmer and len(request.key_persons) != 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Small-scale farmer registration requires exactly one key person",
+        )
+    business_size = compute_business_size(request.employee_count)
+    key_persons_raw = [kp.model_dump() for kp in request.key_persons]
+    esg_flags = compute_esg_flags(key_persons_raw)
+
+    # Farmer registration rules:
+    # - Category is always Fresh Farm Produce
+    # - registration_number / tax_id are not applicable but DB columns are non-null
+    if request.is_small_scale_farmer:
+        effective_primary_category = BusinessCategory.FRESH_FARM_PRODUCE
+        effective_business_categories = [BusinessCategory.FRESH_FARM_PRODUCE]
+        registration_number = (request.registration_number or "N/A").strip() or "N/A"
+        tax_id = (request.tax_id or "N/A").strip() or "N/A"
+    else:
+        if not request.registration_number or not request.registration_number.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Business registration number is required for non-farmer suppliers",
+            )
+        if not request.tax_id or not request.tax_id.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Tax ID / ZIMRA number is required for non-farmer suppliers",
+            )
+        effective_primary_category = request.business_category
+        effective_business_categories = request.business_categories
+        registration_number = request.registration_number.strip()
+        tax_id = request.tax_id.strip()
+
     # Prepare supplier data with password
     supplier_data = {
         "id": str(uuid4()),
         "company_name": request.company_name,
-        "business_category": request.business_category.value,
-        "registration_number": request.registration_number,
-        "tax_id": request.tax_id,
+        "business_category": effective_primary_category.value,
+        "registration_number": registration_number,
+        "tax_id": tax_id,
         "years_in_business": request.years_in_business,
         "website": request.website,
+        "employee_count": request.employee_count,
+        "is_small_scale_farmer": request.is_small_scale_farmer,
+        "business_size": business_size.value if business_size else None,
+        "esg_women_owned": esg_flags["esg_women_owned"],
+        "esg_youth_owned": esg_flags["esg_youth_owned"],
         "contact_person_name": request.contact_person_name,
         "contact_person_title": request.contact_person_title,
         "email": request.email,
@@ -87,7 +147,7 @@ async def create_supplier(request: SupplierCreateRequest):
         "status": SupplierStatus.INCOMPLETE.value,
         "created_at": datetime.utcnow().isoformat(),
     }
-    
+
     # Create supplier in database
     supplier = await db.create_supplier(supplier_data)
     if not supplier:
@@ -95,6 +155,56 @@ async def create_supplier(request: SupplierCreateRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create supplier application"
         )
+
+    supplier_id = supplier["id"]
+
+    # Persist key persons
+    if request.is_small_scale_farmer:
+        farmer_person = request.key_persons[0]
+        kp_data = {
+            "supplier_id": supplier_id,
+            "full_name": request.contact_person_name,
+            "gender": farmer_person.gender.value,
+            "date_of_birth": farmer_person.date_of_birth.isoformat() if farmer_person.date_of_birth else None,
+            "role": "CONTACT",
+        }
+        await db.create_key_person(kp_data)
+    else:
+        for kp in request.key_persons:
+            kp_data = {
+                "supplier_id": supplier_id,
+                "full_name": kp.full_name,
+                "gender": kp.gender.value,
+                "date_of_birth": kp.date_of_birth.isoformat() if kp.date_of_birth else None,
+                "role": kp.role.value,
+            }
+            await db.create_key_person(kp_data)
+
+    # Persist trade references
+    for ref in request.trade_references:
+        ref_data = {
+            "supplier_id": supplier_id,
+            "company_name": ref.company_name,
+            "contact_person_name": ref.contact_person_name,
+            "email": str(ref.email),
+            "phone": ref.phone,
+            "relationship": ref.relationship,
+            "service_product": ref.service_product,
+            "contract_start_date": ref.contract_start_date.isoformat() if ref.contract_start_date else None,
+            "contract_end_date": ref.contract_end_date.isoformat() if ref.contract_end_date else None,
+            "annual_spend": ref.annual_spend,
+            "permission_granted": ref.permission_granted,
+        }
+        await db.create_trade_reference(ref_data)
+
+    # Persist categories
+    for cat in effective_business_categories:
+        cat_data = {
+            "supplier_id": supplier_id,
+            "category": cat.value,
+            "compliance_status": "PENDING",
+        }
+        await db.create_supplier_category(cat_data)
     
     # Log supplier creation
     await audit_service.log_action(
@@ -109,6 +219,8 @@ async def create_supplier(request: SupplierCreateRequest):
             "location": f"{supplier['city']}, {supplier['country']}"
         }
     )
+
+    await invalidate_analytics_cache(scope="summary")
     
     # Send admin notification for new registration
     try:
@@ -140,8 +252,17 @@ async def create_supplier(request: SupplierCreateRequest):
     summary="Get supplier application",
     description="Retrieve supplier application details by ID."
 )
-async def get_supplier(supplier_id: str):
+async def get_supplier(
+    supplier_id: str,
+    current_user: dict = Depends(get_current_user)
+):
     """Get supplier application by ID."""
+    if current_user["type"] == "vendor" and current_user["data"]["id"] != supplier_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only view your own application"
+        )
+        
     supplier = await db.get_supplier_by_id(supplier_id)
     if not supplier:
         raise HTTPException(
@@ -189,26 +310,42 @@ async def update_supplier(supplier_id: str, request: SupplierUpdateRequest):
     
     # Prepare update data
     update_data = {}
-    if request.name is not None:
-        update_data["name"] = request.name
-    if request.location is not None:
-        update_data["location"] = request.location
-    if request.business_type is not None:
-        update_data["business_type"] = request.business_type
-    if request.contact_person is not None:
-        update_data["contact_person"] = request.contact_person
+    if request.company_name is not None:
+        update_data["company_name"] = request.company_name
+    if request.business_category is not None:
+        update_data["business_category"] = request.business_category.value
+    if request.registration_number is not None:
+        update_data["registration_number"] = request.registration_number
+    if request.tax_id is not None:
+        update_data["tax_id"] = request.tax_id
+    if request.years_in_business is not None:
+        update_data["years_in_business"] = request.years_in_business
+    if request.website is not None:
+        update_data["website"] = request.website
+    if request.employee_count is not None:
+        update_data["employee_count"] = request.employee_count
+        new_size = compute_business_size(request.employee_count)
+        update_data["business_size"] = new_size.value if new_size else None
+    if request.is_small_scale_farmer is not None:
+        update_data["is_small_scale_farmer"] = request.is_small_scale_farmer
+    if request.contact_person_name is not None:
+        update_data["contact_person_name"] = request.contact_person_name
+    if request.contact_person_title is not None:
+        update_data["contact_person_title"] = request.contact_person_title
     if request.email is not None:
         update_data["email"] = request.email
     if request.phone is not None:
         update_data["phone"] = request.phone
-    if request.category is not None:
-        update_data["category"] = request.category.value
-    if request.branches is not None:
-        update_data["branches"] = [b.model_dump() for b in request.branches]
-    if request.management_team is not None:
-        update_data["management_team"] = [m.model_dump() for m in request.management_team]
-    if request.years_in_business is not None:
-        update_data["years_in_business"] = request.years_in_business
+    if request.street_address is not None:
+        update_data["street_address"] = request.street_address
+    if request.city is not None:
+        update_data["city"] = request.city
+    if request.state_province is not None:
+        update_data["state_province"] = request.state_province
+    if request.postal_code is not None:
+        update_data["postal_code"] = request.postal_code
+    if request.country is not None:
+        update_data["country"] = request.country
     
     if not update_data:
         return supplier
@@ -236,6 +373,8 @@ async def update_supplier(supplier_id: str, request: SupplierUpdateRequest):
         resource_name=updated_supplier.get("company_name") or supplier.get("company_name"),
         changes=changes
     )
+
+    await invalidate_analytics_cache()
     
     return updated_supplier
 
@@ -274,23 +413,45 @@ async def submit_supplier_application(supplier_id: str, request: SupplierSubmitR
             detail=f"Cannot submit application with status '{supplier['status']}'"
         )
     
-    # Get required documents for this category
-    category = BusinessCategory(supplier["category"])
-    required_docs = get_required_documents(category)
-    
-    # Get uploaded documents
+    # Fetch all categories for this supplier (multi-category support)
+    supplier_category_rows = await db.get_supplier_categories(supplier_id)
+    if supplier_category_rows:
+        all_categories = [BusinessCategory(row["category"]) for row in supplier_category_rows]
+    else:
+        # Fall back to the primary category
+        all_categories = [BusinessCategory(supplier["business_category"])]
+
+    # Get uploaded document types
     documents = await db.get_documents_by_supplier(supplier_id)
     uploaded_types = {doc["document_type"] for doc in documents}
-    
-    # Check if all required documents are uploaded
-    missing_docs = [doc.value for doc in required_docs if doc.value not in uploaded_types]
+
+    # 1. Check statutory mandatory documents
+    supplier_type = get_supplier_type(
+        supplier.get("country", ""),
+        supplier.get("is_small_scale_farmer", False),
+    )
+    statutory_docs = get_statutory_documents(supplier_type)
+    missing_statutory = [
+        dt.value for dt in statutory_docs if dt.value not in uploaded_types
+    ]
+
+    # 2. Check mandatory cert groups — require at least ONE doc per mandatory group
+    missing_groups: list[str] = []
+    for cat in all_categories:
+        for grp in CERT_GROUPS_BY_CATEGORY.get(cat, []):
+            if not grp.is_mandatory_upload:
+                continue
+            if not any(dt.value in uploaded_types for dt in grp.document_types):
+                missing_groups.append(grp.name)
+
+    missing_docs = missing_statutory + missing_groups
     if missing_docs:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
                 "message": "Missing required documents",
-                "missing_documents": missing_docs
-            }
+                "missing_documents": missing_docs,
+            },
         )
     
     # Update status to SUBMITTED
@@ -314,6 +475,12 @@ async def submit_supplier_application(supplier_id: str, request: SupplierSubmitR
         vendor_password = None
     
     await db.update_supplier(supplier_id, update_data)
+
+    # Compute initial per-category compliance levels from verified uploads.
+    try:
+        await db.recompute_supplier_category_compliance(supplier_id)
+    except Exception as compliance_err:
+        print(f"⚠️  compliance recompute skipped for {supplier_id}: {compliance_err}")
     
     # Send email notifications
     try:
@@ -403,7 +570,7 @@ async def submit_supplier_application(supplier_id: str, request: SupplierSubmitR
                         </tr>
                         <tr>
                             <td style="padding: 8px 0; font-weight: 600; color: #4b5563;">Business Category:</td>
-                            <td style="padding: 8px 0; color: #1f2937;">{supplier['category'].replace('_', ' ').title()}</td>
+                            <td style="padding: 8px 0; color: #1f2937;">{supplier['business_category'].replace('_', ' ').title()}</td>
                         </tr>
                         <tr>
                             <td style="padding: 8px 0; font-weight: 600; color: #4b5563;">Contact Person:</td>
@@ -472,7 +639,7 @@ async def submit_supplier_application(supplier_id: str, request: SupplierSubmitR
                     admin_ids=admin_ids,
                     supplier_id=supplier_id,
                     supplier_name=supplier["company_name"],
-                    category=supplier["category"],
+                    category=supplier["business_category"],
                     metadata={
                         "contact_person": supplier["contact_person_name"],
                         "email": supplier["email"],
@@ -499,6 +666,8 @@ async def submit_supplier_application(supplier_id: str, request: SupplierSubmitR
             "submitted_at": update_data["submitted_at"]
         }
     )
+
+    await invalidate_analytics_cache()
     
     return SuccessResponse(
         success=True,
@@ -512,7 +681,11 @@ async def submit_supplier_application(supplier_id: str, request: SupplierSubmitR
     summary="Get document upload status",
     description="Get the upload status for all required documents."
 )
-async def get_document_upload_status(supplier_id: str):
+async def get_document_upload_status(supplier_id: str, current_user: dict = Depends(get_current_user)):
+
+    if current_user["type"] == "vendor" and current_user["data"]["id"] != supplier_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only access your own application")
+
     """
     Get the document upload status for a supplier application.
     
@@ -526,7 +699,7 @@ async def get_document_upload_status(supplier_id: str):
             detail="Supplier not found"
         )
     
-    category = BusinessCategory(supplier["category"])
+    category = BusinessCategory(supplier["business_category"])
     required_docs = get_required_documents(category)
     
     # Get uploaded documents
@@ -557,7 +730,7 @@ async def get_document_upload_status(supplier_id: str):
     
     return SupplierDocumentStatusResponse(
         supplier_id=supplier_id,
-        category=supplier["category"],
+        category=supplier["business_category"],
         documents=doc_statuses,
         total_required=total_required,
         total_uploaded=total_uploaded,
@@ -600,3 +773,287 @@ async def check_email_exists(email: str):
         "exists": existing is not None,
         "message": "Email already registered" if existing else "Email available"
     }
+
+
+# ============== Category Requirements ==============
+
+@router.get(
+    "/category/{category}/requirements",
+    response_model=CategoryRequirementsResponse,
+    summary="Get cert groups for a business category",
+    description="Returns all certification groups with their required documents for a given category."
+)
+async def get_category_requirements(category: BusinessCategory):
+    """Return cert groups (pick-at-least-one sets) for the given category."""
+    return CategoryRequirementsResponse.for_category(category)
+
+
+# ============== Key Persons ==============
+
+@router.get(
+    "/{supplier_id}/key-persons",
+    response_model=KeyPersonListResponse,
+    summary="List key persons for a supplier",
+)
+async def list_key_persons(supplier_id: str, current_user: dict = Depends(get_current_user)):
+
+    if current_user["type"] == "vendor" and current_user["data"]["id"] != supplier_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only access your own application")
+
+    supplier = await db.get_supplier_by_id(supplier_id)
+    if not supplier:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Supplier not found")
+    persons = await db.get_key_persons_by_supplier(supplier_id)
+    return KeyPersonListResponse(key_persons=[KeyPersonResponse(**p) for p in persons])
+
+
+@router.post(
+    "/{supplier_id}/key-persons",
+    response_model=KeyPersonResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Add a key person to a supplier",
+)
+async def add_key_person(supplier_id: str, request: KeyPersonRequest, current_user: dict = Depends(get_current_user)):
+
+    if current_user["type"] == "vendor" and current_user["data"]["id"] != supplier_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only access your own application")
+
+    supplier = await db.get_supplier_by_id(supplier_id)
+    if not supplier:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Supplier not found")
+
+    existing = await db.get_key_persons_by_supplier(supplier_id)
+    if len(existing) >= 3:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Maximum 3 key persons allowed")
+
+    kp_data = {
+        "supplier_id": supplier_id,
+        "full_name": request.full_name,
+        "gender": request.gender.value,
+        "date_of_birth": request.date_of_birth.isoformat() if request.date_of_birth else None,
+        "role": request.role.value,
+    }
+    created = await db.create_key_person(kp_data)
+    if not created:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to add key person")
+
+    # Recompute ESG flags
+    all_persons = await db.get_key_persons_by_supplier(supplier_id)
+    esg_flags = compute_esg_flags(all_persons)
+    await db.update_supplier(supplier_id, {**esg_flags, "updated_at": datetime.utcnow().isoformat()})
+
+    await invalidate_analytics_cache(scope="summary")
+
+    return KeyPersonResponse(**created)
+
+
+@router.delete(
+    "/{supplier_id}/key-persons/{key_person_id}",
+    response_model=SuccessResponse,
+    summary="Remove a key person from a supplier",
+)
+async def remove_key_person(supplier_id: str, key_person_id: str, current_user: dict = Depends(get_current_user)):
+
+    if current_user["type"] == "vendor" and current_user["data"]["id"] != supplier_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only access your own application")
+
+    supplier = await db.get_supplier_by_id(supplier_id)
+    if not supplier:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Supplier not found")
+
+    await db.delete_key_person(key_person_id)
+
+    # Recompute ESG flags
+    all_persons = await db.get_key_persons_by_supplier(supplier_id)
+    esg_flags = compute_esg_flags(all_persons)
+    await db.update_supplier(supplier_id, {**esg_flags, "updated_at": datetime.utcnow().isoformat()})
+
+    await invalidate_analytics_cache(scope="summary")
+
+    return SuccessResponse(success=True, message="Key person removed")
+
+
+# ============== Supplier Categories ==============
+
+@router.get(
+    "/{supplier_id}/categories",
+    response_model=SupplierCategoryListResponse,
+    summary="List categories for a supplier",
+)
+async def list_supplier_categories(supplier_id: str, current_user: dict = Depends(get_current_user)):
+
+    if current_user["type"] == "vendor" and current_user["data"]["id"] != supplier_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only access your own application")
+
+    supplier = await db.get_supplier_by_id(supplier_id)
+    if not supplier:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Supplier not found")
+    cats = await db.get_supplier_categories(supplier_id)
+    return SupplierCategoryListResponse(categories=[SupplierCategoryResponse(**c) for c in cats])
+
+
+@router.get(
+    "/{supplier_id}/category-access",
+    summary="Get allowed and blocked business categories for a supplier",
+)
+async def get_supplier_category_access(
+    supplier_id: str,
+    category: Optional[BusinessCategory] = Query(
+        None,
+        description="Optional category to evaluate directly for participation eligibility",
+    ),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return category-level participation eligibility for Phase 2B enforcement."""
+    if current_user["type"] == "vendor" and current_user["data"]["id"] != supplier_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only access your own application")
+
+    supplier = await db.get_supplier_by_id(supplier_id)
+    if not supplier:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Supplier not found")
+
+    access_summary = await db.get_supplier_category_access_summary(supplier_id)
+    supplier_status = (supplier.get("status") or "").upper()
+
+    globally_blocked = (
+        supplier_status == SupplierStatus.SUSPENDED.value
+        or not bool(access_summary.get("mandatory_statutory_met"))
+    )
+    allowed_categories = list(access_summary.get("allowed_categories") or [])
+    blocked_categories = list(access_summary.get("blocked_categories") or [])
+
+    category_value = category.value if category else None
+    category_allowed: Optional[bool] = None
+    if category_value:
+        category_allowed = category_value in allowed_categories and category_value not in blocked_categories
+
+    can_participate = (not globally_blocked) and len(allowed_categories) > 0
+    if category_allowed is not None:
+        can_participate = can_participate and category_allowed
+
+    return {
+        "supplier_id": supplier_id,
+        "supplier_status": supplier_status,
+        "mandatory_statutory_met": bool(access_summary.get("mandatory_statutory_met")),
+        "allowed_categories": allowed_categories,
+        "blocked_categories": blocked_categories,
+        "excluded_categories": list(access_summary.get("excluded_categories") or []),
+        "mandatory_met_categories": int(access_summary.get("mandatory_met_categories", 0) or 0),
+        "mandatory_missing_categories": int(access_summary.get("mandatory_missing_categories", 0) or 0),
+        "non_excluded_categories": int(access_summary.get("non_excluded_categories", 0) or 0),
+        "requested_category": category_value,
+        "requested_category_allowed": category_allowed,
+        "globally_blocked": globally_blocked,
+        "can_participate": can_participate,
+    }
+
+
+@router.post(
+    "/{supplier_id}/categories",
+    response_model=SupplierCategoryResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Add a category to a supplier",
+)
+async def add_supplier_category(supplier_id: str, request: SupplierCategoryRequest, current_user: dict = Depends(get_current_user)):
+
+    if current_user["type"] == "vendor" and current_user["data"]["id"] != supplier_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only access your own application")
+
+    supplier = await db.get_supplier_by_id(supplier_id)
+    if not supplier:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Supplier not found")
+
+    existing = await db.get_supplier_categories(supplier_id)
+    if len(existing) >= 6:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Maximum 6 categories allowed")
+    if any(c["category"] == request.category.value for c in existing):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Category already assigned")
+
+    cat_data = {
+        "supplier_id": supplier_id,
+        "category": request.category.value,
+        "compliance_status": "PENDING",
+    }
+    created = await db.create_supplier_category(cat_data)
+    if not created:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to add category")
+
+    await invalidate_analytics_cache(scope="summary")
+
+    return SupplierCategoryResponse(**created)
+
+
+@router.delete(
+    "/{supplier_id}/categories/{category}",
+    response_model=SuccessResponse,
+    summary="Remove a category from a supplier",
+)
+async def remove_supplier_category(supplier_id: str, category: BusinessCategory, current_user: dict = Depends(get_current_user)):
+
+    if current_user["type"] == "vendor" and current_user["data"]["id"] != supplier_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only access your own application")
+
+    supplier = await db.get_supplier_by_id(supplier_id)
+    if not supplier:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Supplier not found")
+    await db.delete_supplier_category(supplier_id, category.value)
+
+    await invalidate_analytics_cache(scope="summary")
+
+    return SuccessResponse(success=True, message="Category removed")
+
+
+# ============== Farmer Application Form ==============
+
+@router.get(
+    "/{supplier_id}/farmer-form",
+    response_model=FarmerApplicationFormResponse,
+    summary="Get farmer application form for a supplier",
+)
+async def get_farmer_form(supplier_id: str, current_user: dict = Depends(get_current_user)):
+
+    if current_user["type"] == "vendor" and current_user["data"]["id"] != supplier_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only access your own application")
+
+    supplier = await db.get_supplier_by_id(supplier_id)
+    if not supplier:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Supplier not found")
+    form = await db.get_farmer_form(supplier_id)
+    if not form:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Farmer form not found")
+    return FarmerApplicationFormResponse(**form)
+
+
+@router.post(
+    "/{supplier_id}/farmer-form",
+    response_model=FarmerApplicationFormResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create or update farmer application form",
+)
+async def upsert_farmer_form(supplier_id: str, request: FarmerApplicationFormRequest, current_user: dict = Depends(get_current_user)):
+
+    if current_user["type"] == "vendor" and current_user["data"]["id"] != supplier_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only access your own application")
+
+    supplier = await db.get_supplier_by_id(supplier_id)
+    if not supplier:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Supplier not found")
+    if not supplier.get("is_small_scale_farmer"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Farmer form is only for small-scale farmer suppliers"
+        )
+
+    form_data = {
+        "supplier_id": supplier_id,
+        **request.model_dump(exclude_none=True),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    saved = await db.create_farmer_form(form_data)
+    if not saved:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to save farmer form")
+    return FarmerApplicationFormResponse(**saved)
+
+
+
+

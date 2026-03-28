@@ -14,6 +14,8 @@ class NotificationType(str, Enum):
     APPLICATION_SUBMITTED = "application_submitted"
     NEW_MESSAGE = "new_message"
     SYSTEM_ANNOUNCEMENT = "system_announcement"
+    DOCUMENT_EXPIRY_WARNING = "document_expiry_warning"
+    DOCUMENT_EXPIRED = "document_expired"
 
 
 class RecipientType(str, Enum):
@@ -31,7 +33,9 @@ NOTIFICATION_TYPE_LABELS = {
     NotificationType.PROFILE_UPDATE_REQUESTED: "Update Requested",
     NotificationType.APPLICATION_SUBMITTED: "Application Submitted",
     NotificationType.NEW_MESSAGE: "New Message",
-    NotificationType.SYSTEM_ANNOUNCEMENT: "Announcement"
+    NotificationType.SYSTEM_ANNOUNCEMENT: "Announcement",
+    NotificationType.DOCUMENT_EXPIRY_WARNING: "Document Expiry Warning",
+    NotificationType.DOCUMENT_EXPIRED: "Document Expired",
 }
 
 
