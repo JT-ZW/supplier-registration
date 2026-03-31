@@ -20,7 +20,6 @@ from openpyxl.drawing.image import Image as ExcelImage
 from ..db.supabase import db
 from ..models import BusinessCategory, SupplierStatus
 from ..core.timezone import get_cat_now, format_cat_datetime
-from ..core.timezone import get_cat_now, format_cat_datetime
 
 
 class ReportService:
@@ -45,14 +44,39 @@ class ReportService:
         """
         Get filtered list of suppliers based on criteria.
         """
-        # Get all suppliers directly from table
-        result = db.client.table("suppliers").select("*").execute()
+        # Fetch only the columns actually consumed by the report renderer.
+        # Always scoped to APPROVED — the DB filter avoids transferring rows
+        # that are discarded unconditionally in every report type.
+        _SUPPLIER_COLUMNS = (
+            "id,status,company_name,business_category,"
+            "city,country,state_province,street_address,postal_code,"
+            "years_in_business,is_small_scale_farmer,business_size,"
+            "submitted_at,created_at,updated_at,"
+            "contact_person_name,contact_person_title,email,phone,"
+            "registration_number,tax_id,website"
+        )
+        result = (
+            db.client.table("suppliers")
+            .select(_SUPPLIER_COLUMNS)
+            .eq("status", "APPROVED")
+            .execute()
+        )
         suppliers = result.data if result.data else []
-        
-        # Apply filters
+
+        # Enrich each supplier with all their categories from supplier_categories
+        if suppliers:
+            all_ids = [s["id"] for s in suppliers]
+            cats_resp = db.client.table("supplier_categories").select("supplier_id, category").in_("supplier_id", all_ids).execute()
+            cats_by_supplier: Dict[str, List[str]] = {}
+            for row in (cats_resp.data or []):
+                cats_by_supplier.setdefault(row["supplier_id"], []).append(row["category"])
+            for s in suppliers:
+                s["business_categories"] = cats_by_supplier.get(s["id"]) or [s["business_category"]]
+
+        # Apply remaining filters (date range, category, location, years)
         filtered = []
         for supplier in suppliers:
-            # Date filter (created_at or submitted_at)
+            # Date filter (submitted_at with fallback to created_at)
             if start_date or end_date:
                 supplier_date_str = supplier.get("submitted_at") or supplier.get("created_at")
                 if supplier_date_str:
@@ -62,17 +86,14 @@ class ReportService:
                             continue
                         if end_date and supplier_date > end_date:
                             continue
-                    except:
+                    except Exception:
                         pass
             
-            # Status filter
-            if status and supplier.get("status"):
-                if supplier["status"] not in [s.value for s in status]:
-                    continue
-            
-            # Category filter
-            if category and supplier.get("business_category"):
-                if supplier["business_category"] not in [c.value for c in category]:
+            # Category filter — check all the supplier's categories, not just the primary one
+            if category:
+                filter_values = [c.value for c in category]
+                supplier_cats = supplier.get("business_categories") or [supplier.get("business_category")]
+                if not any(c in filter_values for c in supplier_cats):
                     continue
             
             # Location filter (check both city and country)
@@ -290,11 +311,12 @@ class ReportService:
             ],
           }
         """
-        # Count total suppliers per category
+        # Count total suppliers per category (multi-category aware)
         cat_totals: Dict[str, int] = {}
         for s in suppliers:
-            cat = s.get("business_category") or "UNKNOWN"
-            cat_totals[cat] = cat_totals.get(cat, 0) + 1
+            sup_cats = s.get("business_categories") or [s.get("business_category") or "UNKNOWN"]
+            for cat in sup_cats:
+                cat_totals[cat] = cat_totals.get(cat, 0) + 1
 
         # Build supplier lookup
         supplier_lookup = {s["id"]: s for s in suppliers}
@@ -306,12 +328,13 @@ class ReportService:
             sup = supplier_lookup.get(doc["supplier_id"])
             if not sup:
                 continue
-            cat = sup.get("business_category") or "UNKNOWN"
-            if cat not in cat_submitters:
-                cat_submitters[cat] = set()
-                cat_docs[cat] = []
-            cat_submitters[cat].add(doc["supplier_id"])
-            cat_docs[cat].append({"supplier": sup, **doc})
+            sup_cats = sup.get("business_categories") or [sup.get("business_category") or "UNKNOWN"]
+            for cat in sup_cats:
+                if cat not in cat_submitters:
+                    cat_submitters[cat] = set()
+                    cat_docs[cat] = []
+                cat_submitters[cat].add(doc["supplier_id"])
+                cat_docs[cat].append({"supplier": sup, **doc})
 
         total_suppliers = len(suppliers)
         total_submitters = len({d["supplier_id"] for d in sustainability_docs if d["supplier_id"] in supplier_lookup})
@@ -371,12 +394,6 @@ class ReportService:
             sort_by=sort_by, sort_order=sort_order,
         )
 
-        # Fetch sustainability/QC document submissions for the filtered suppliers
-        _pdf_supplier_ids = [s["id"] for s in suppliers]
-        sustainability_docs = await db.get_sustainability_doc_submissions(
-            supplier_ids=_pdf_supplier_ids if _pdf_supplier_ids else None
-        )
-
         # Create PDF buffer
         buffer = BytesIO()
         
@@ -420,7 +437,44 @@ class ReportService:
             fontSize=10,
             textColor=colors.HexColor('#4b5563'),
         )
-        
+
+        # Cell styles for wrapping table content
+        cell_style = ParagraphStyle(
+            'CellStyle',
+            parent=styles['Normal'],
+            fontSize=8,
+            fontName='Helvetica',
+            leading=11,
+            textColor=colors.HexColor('#1f2937'),
+        )
+        cat_cell_style = ParagraphStyle(
+            'CatCellStyle',
+            parent=styles['Normal'],
+            fontSize=7.5,
+            fontName='Helvetica',
+            leading=10,
+            textColor=colors.HexColor('#374151'),
+        )
+        kpi_style = ParagraphStyle(
+            'KPIStyle',
+            parent=styles['Normal'],
+            fontSize=18,
+            fontName='Helvetica-Bold',
+            textColor=colors.HexColor('#0066cc'),
+            alignment=TA_CENTER,
+            leading=22,
+        )
+
+        # Status colour map used throughout
+        STATUS_COLORS = {
+            'APPROVED': colors.HexColor('#16a34a'),
+            'PENDING': colors.HexColor('#9ca3af'),
+            'UNDER_REVIEW': colors.HexColor('#2563eb'),
+            'COMPLIANCE_REQUIRED': colors.HexColor('#d97706'),
+            'SUSPENDED': colors.HexColor('#dc2626'),
+            'REJECTED': colors.HexColor('#7f1d1d'),
+        }
+
         # Add title
         logo_path = os.path.join(os.path.dirname(__file__), '..', 'core', 'rtg-logo.png')
         if os.path.exists(logo_path):
@@ -454,6 +508,49 @@ class ReportService:
         
         elements.append(Spacer(1, 0.3 * inch))
 
+        # ── Executive KPI Banner ───────────────────────────────────────────
+        if suppliers:
+            _unique_cats: set = set()
+            _total_years = 0.0
+            _years_count = 0
+            for _s in suppliers:
+                for _c in (_s.get('business_categories') or [_s.get('business_category') or 'Unknown']):
+                    _unique_cats.add(_c)
+                _yib = _s.get('years_in_business')
+                if _yib is not None:
+                    try:
+                        _total_years += float(_yib)
+                        _years_count += 1
+                    except (ValueError, TypeError):
+                        pass
+            _avg_years = f"{_total_years / _years_count:.1f}" if _years_count else "N/A"
+
+            def _kpi_cell(value: str, label: str) -> Paragraph:
+                return Paragraph(
+                    f"<font size='20' color='#0066cc'><b>{value}</b></font><br/>"
+                    f"<font size='8' color='#6b7280'>{label}</font>",
+                    kpi_style,
+                )
+
+            _kpi_data = [[
+                _kpi_cell(str(len(suppliers)), "Total Approved Suppliers"),
+                _kpi_cell(str(len(_unique_cats)), "Active Supply Categories"),
+                _kpi_cell(f"{_avg_years} yrs", "Avg. Business Tenure"),
+                _kpi_cell(get_cat_now().strftime('%b %Y'), "Report Period"),
+            ]]
+            _kpi_tbl = Table(_kpi_data, colWidths=[2.7 * inch] * 4)
+            _kpi_tbl.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f0f7ff')),
+                ('BOX', (0, 0), (-1, -1), 1.5, colors.HexColor('#0066cc')),
+                ('LINEAFTER', (0, 0), (2, -1), 0.75, colors.HexColor('#bfdbfe')),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('TOPPADDING', (0, 0), (-1, -1), 14),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 14),
+            ]))
+            elements.append(_kpi_tbl)
+            elements.append(Spacer(1, 0.3 * inch))
+
         # ── Summary section ────────────────────────────────────────────────
         if include_summary and suppliers:
             elements.append(Paragraph("Report Summary", heading_style))
@@ -463,17 +560,18 @@ class ReportService:
             _cat_counts: Dict[str, int] = {}
             for _s in suppliers:
                 _sv = _s.get('status', 'Unknown')
-                _cv = _s.get('business_category', 'Unknown')
                 _status_counts[_sv] = _status_counts.get(_sv, 0) + 1
-                _cat_counts[_cv] = _cat_counts.get(_cv, 0) + 1
+                for _cv in (_s.get('business_categories') or [_s.get('business_category') or 'Unknown']):
+                    _cat_counts[_cv] = _cat_counts.get(_cv, 0) + 1
 
             elements.append(Paragraph("Status Distribution", normal_style))
             elements.append(Spacer(1, 0.1 * inch))
             _st_data = [['Status', 'Suppliers', 'Percentage']]
+            _st_status_vals = []
             for _sv, _cnt in sorted(_status_counts.items()):
                 _st_data.append([_sv.upper(), str(_cnt), f"{_cnt/len(suppliers)*100:.1f}%"])
-            _st_tbl = Table(_st_data, colWidths=[3*inch, 2*inch, 1.5*inch])
-            _st_tbl.setStyle(TableStyle([
+                _st_status_vals.append(_sv.upper())
+            _st_style = [
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3b82f6')),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
                 ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
@@ -481,47 +579,71 @@ class ReportService:
                 ('FONTSIZE', (0, 0), (-1, 0), 10),
                 ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
                 ('FONTSIZE', (0, 1), (-1, -1), 9),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
                 ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
                 ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#eff6ff')]),
-            ]))
+            ]
+            for _ri, _sv in enumerate(_st_status_vals, 1):
+                _sc = STATUS_COLORS.get(_sv, colors.HexColor('#6b7280'))
+                _st_style.append(('TEXTCOLOR', (0, _ri), (0, _ri), _sc))
+                _st_style.append(('FONTNAME', (0, _ri), (0, _ri), 'Helvetica-Bold'))
+            _st_tbl = Table(_st_data, colWidths=[3*inch, 2*inch, 1.5*inch])
+            _st_tbl.setStyle(TableStyle(_st_style))
             elements.append(_st_tbl)
             elements.append(Spacer(1, 0.3 * inch))
 
             elements.append(Paragraph("Category Distribution", normal_style))
             elements.append(Spacer(1, 0.1 * inch))
-            _cd_data = [['Business Category', 'Suppliers', 'Percentage']]
+            _cd_data = [['Business Category', 'Suppliers', 'Share', 'Coverage']]
+            _cd_pcts = []
+            _total_supplier_count = len(suppliers)
             for _cv, _cnt in sorted(_cat_counts.items(), key=lambda x: x[1], reverse=True):
-                _cd_data.append([_cv.replace('_', ' ').title(), str(_cnt), f"{_cnt/len(suppliers)*100:.1f}%"])
-            _cd_tbl = Table(_cd_data, colWidths=[3*inch, 2*inch, 1.5*inch])
-            _cd_tbl.setStyle(TableStyle([
+                _pct = (_cnt / _total_supplier_count * 100) if _total_supplier_count else 0.0
+                _filled = round(_pct / 10)
+                _bar = ('█' * _filled) + ('░' * (10 - _filled))
+                _cd_data.append([_cv.replace('_', ' ').title(), str(_cnt), f"{_pct:.1f}%", _bar])
+                _cd_pcts.append(_pct)
+            _cd_style = [
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3b82f6')),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
                 ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('ALIGN', (0, 1), (0, -1), 'LEFT'),
                 ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
                 ('FONTSIZE', (0, 0), (-1, 0), 10),
                 ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
                 ('FONTSIZE', (0, 1), (-1, -1), 9),
+                ('FONTNAME', (3, 1), (3, -1), 'Courier'),
+                ('FONTSIZE', (3, 1), (3, -1), 8),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
                 ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
                 ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#eff6ff')]),
-            ]))
+            ]
+            for _ri, _pct in enumerate(_cd_pcts, 1):
+                if _pct >= 33:
+                    _pct_c = colors.HexColor('#16a34a')
+                elif _pct >= 15:
+                    _pct_c = colors.HexColor('#d97706')
+                else:
+                    _pct_c = colors.HexColor('#dc2626')
+                _cd_style.append(('TEXTCOLOR', (2, _ri), (2, _ri), _pct_c))
+                _cd_style.append(('FONTNAME', (2, _ri), (2, _ri), 'Helvetica-Bold'))
+                _cd_style.append(('TEXTCOLOR', (3, _ri), (3, _ri), _pct_c))
+            _cd_tbl = Table(_cd_data, colWidths=[3.2*inch, 1.3*inch, 1.0*inch, 2.0*inch])
+            _cd_tbl.setStyle(TableStyle(_cd_style))
             elements.append(_cd_tbl)
             elements.append(PageBreak())
 
         # ── Sustainability section (per-category) ──────────────────────────
         if include_sustainability:
             _enhanced_metrics = await self._build_enhanced_sustainability_metrics(suppliers)
-            _sustain_data = self._build_sustainability_by_category(suppliers, sustainability_docs)
-            _sc_total = _sustain_data["total_suppliers"]
-            _sc_submitters = _sustain_data["total_submitters"]
-            _sc_rate = _sustain_data["overall_rate"]
-            _sc_by_cat = _sustain_data["by_category"]
-            _status_scope = ", ".join([s.value for s in status]) if status else "ALL"
 
             elements.append(Paragraph("Sustainability & ESG Metrics", heading_style))
             elements.append(Spacer(1, 0.15 * inch))
 
             elements.append(Paragraph(
-                f"<b>Scope:</b> {_enhanced_metrics['total_suppliers']} suppliers in this report (status filter: {_status_scope}).",
+                f"<b>Scope:</b> {_enhanced_metrics['total_suppliers']} APPROVED suppliers.",
                 normal_style,
             ))
             elements.append(Spacer(1, 0.08 * inch))
@@ -607,162 +729,145 @@ class ReportService:
             elements.append(_size_tbl)
             elements.append(Spacer(1, 0.25 * inch))
 
-            elements.append(Paragraph("Optional Certification Submissions (Legacy View)", normal_style))
+            # ── Category Compliance ───────────────────────────────────────
+            _cat_compliance = await db.get_category_compliance_stats(status="APPROVED")
+            _cat_compliance = [r for r in _cat_compliance if r.get("total_suppliers", 0) > 0]
+
+            elements.append(Paragraph("Category Compliance Overview", normal_style))
             elements.append(Spacer(1, 0.08 * inch))
-            elements.append(Paragraph(
-                f"<b>{_sc_submitters}</b> out of <b>{_sc_total}</b> suppliers ({_sc_rate:.1f}%) have submitted "
-                "one or more voluntary sustainability or quality control certification documents.",
-                normal_style,
-            ))
+            _cc_data = [["Business Category", "Total", "Mand. Met", "Mand. Missing",
+                         "Full Compliance", "Med Risk", "High Risk", "Pending", "Compliance %"]]
+            for _r in _cat_compliance:
+                _cc_data.append([
+                    _r["category"].replace("_", " ").title()[:30],
+                    str(_r["total_suppliers"]),
+                    str(_r["mandatory_met_count"]),
+                    str(_r["mandatory_missing_count"]),
+                    str(_r["full_compliance_count"]),
+                    str(_r["medium_risk_count"]),
+                    str(_r["high_risk_count"]),
+                    str(_r["pending_count"]),
+                    f"{_r['full_compliance_pct']:.1f}%",
+                ])
+            if len(_cc_data) > 1:
+                _cc_tbl = Table(_cc_data, colWidths=[2.1*inch, 0.55*inch, 0.7*inch, 0.9*inch,
+                                                      0.85*inch, 0.65*inch, 0.65*inch, 0.55*inch, 0.8*inch], repeatRows=1)
+                _cc_style = [
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1d4ed8')),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, 0), 8),
+                    ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+                    ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                    ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                    ('FONTSIZE', (0, 1), (-1, -1), 8),
+                    ('TOPPADDING', (0, 0), (-1, -1), 4),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                    ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#d1d5db')),
+                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#eff6ff')]),
+                ]
+                for _ri, _r in enumerate(_cat_compliance, start=1):
+                    if _r.get("high_risk_count", 0) > 0:
+                        _cc_style.append(('TEXTCOLOR', (6, _ri), (6, _ri), colors.HexColor('#dc2626')))
+                    if _r.get("mandatory_missing_count", 0) > 0:
+                        _cc_style.append(('TEXTCOLOR', (3, _ri), (3, _ri), colors.HexColor('#dc2626')))
+                _cc_tbl.setStyle(TableStyle(_cc_style))
+                elements.append(_cc_tbl)
+            else:
+                elements.append(Paragraph("No category compliance data available.", normal_style))
             elements.append(Spacer(1, 0.25 * inch))
 
-            # Tier 1 — Category Coverage Summary
-            elements.append(Paragraph("Coverage by Category", normal_style))
-            elements.append(Spacer(1, 0.1 * inch))
-            _cov_rows = [['Business Category', 'Suppliers in Category', 'With Sustainability Docs', 'Coverage']]
-            for _bc in _sc_by_cat:
-                _row_vals = [
-                    _bc["display"],
-                    str(_bc["total"]),
-                    str(_bc["submitters"]) if _bc["submitters"] > 0 else "—",
-                    f"{_bc['rate']:.1f}%" if _bc["submitters"] > 0 else "0%",
-                ]
-                _cov_rows.append(_row_vals)
-            # Grand total row
-            _cov_rows.append([
-                "All Categories",
-                str(_sc_total),
-                str(_sc_submitters),
-                f"{_sc_rate:.1f}%",
-            ])
-
-            _cov_tbl = Table(_cov_rows, colWidths=[2.8*inch, 1.8*inch, 2.1*inch, 1.2*inch], repeatRows=1)
-            _cov_style = [
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#16a34a')),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 9),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
-                ('TOPPADDING', (0, 0), (-1, 0), 8),
-                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-                ('FONTSIZE', (0, 1), (-1, -1), 8),
-                ('TOPPADDING', (0, 1), (-1, -1), 5),
-                ('BOTTOMPADDING', (0, 1), (-1, -1), 5),
-                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#d1d5db')),
-                ('ROWBACKGROUNDS', (0, 1), (-1, -2), [colors.white, colors.HexColor('#f0fdf4')]),
-                # Grand total row — bold + slightly shaded
-                ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#dcfce7')),
-                ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, -1), (-1, -1), 9),
-            ]
-            # Dim zero-coverage rows
-            for _ri, _bc in enumerate(_sc_by_cat, start=1):
-                if _bc["submitters"] == 0:
-                    _cov_style.append(('TEXTCOLOR', (0, _ri), (-1, _ri), colors.HexColor('#9ca3af')))
-            _cov_tbl.setStyle(TableStyle(_cov_style))
-            elements.append(_cov_tbl)
-            elements.append(Spacer(1, 0.3 * inch))
-
-            # Tier 2 — Detail breakdown per category (only categories with submissions)
-            _active_cats = [_bc for _bc in _sc_by_cat if _bc["submitters"] > 0]
-            if _active_cats:
-                elements.append(Paragraph("Breakdown by Category", normal_style))
-                elements.append(Spacer(1, 0.1 * inch))
-
-                _SUSTAIN_DISPLAY = {
-                    'FOOD_SAFETY_CERTIFICATION': 'Food Safety Certification',
-                    'GOOD_AGRICULTURAL_PRACTICES': 'Good Agricultural Practices (GAP)',
-                    'ISO_14000': 'ISO 14000 (Environmental Management)',
-                    'ISO_45000': 'ISO 45000 (Occupational Health & Safety)',
-                    'INDUSTRY_CERTIFICATION': 'Industry Certification',
-                }
-
-                _sub_heading_style = ParagraphStyle(
-                    'SubHeading',
-                    parent=normal_style,
-                    fontSize=9,
-                    fontName='Helvetica-Bold',
-                    textColor=colors.HexColor('#15803d'),
-                    spaceBefore=10,
-                    spaceAfter=4,
-                )
-
-                for _bc in _active_cats:
-                    elements.append(Paragraph(
-                        f"{_bc['display']}  —  {_bc['submitters']} of {_bc['total']} suppliers ({_bc['rate']:.1f}%)",
-                        _sub_heading_style,
-                    ))
-                    _detail_rows = [['Company Name', 'Certification Document', 'Verification Status', 'Date Submitted']]
-                    for _d in _bc["docs"]:
-                        _detail_rows.append([
-                            (_d["supplier"].get("company_name") or "Unknown")[:35],
-                            _SUSTAIN_DISPLAY.get(_d["document_type"], _d["document_type"].replace("_", " ").title()),
-                            (_d.get("verification_status") or "PENDING").upper(),
-                            format_cat_datetime(_d.get("uploaded_at"), "%Y-%m-%d") if _d.get("uploaded_at") else "N/A",
-                        ])
-                    _det_tbl = Table(
-                        _detail_rows,
-                        colWidths=[2.8*inch, 3.2*inch, 1.6*inch, 1.3*inch],
-                        repeatRows=1,
-                    )
-                    _det_tbl.setStyle(TableStyle([
-                        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#bbf7d0')),
-                        ('TEXTCOLOR', (0, 0), (-1, 0), colors.HexColor('#14532d')),
-                        ('ALIGN', (0, 0), (-1, 0), 'LEFT'),
-                        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                        ('FONTSIZE', (0, 0), (-1, 0), 8),
-                        ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
-                        ('TOPPADDING', (0, 0), (-1, 0), 6),
-                        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-                        ('FONTSIZE', (0, 1), (-1, -1), 8),
-                        ('TOPPADDING', (0, 1), (-1, -1), 4),
-                        ('BOTTOMPADDING', (0, 1), (-1, -1), 4),
-                        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#d1d5db')),
-                        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f0fdf4')]),
-                    ]))
-                    elements.append(_det_tbl)
-                    elements.append(Spacer(1, 0.15 * inch))
+            # ── Document Type Statistics ──────────────────────────────────
+            _doc_stats = await db.get_document_type_stats()
+            if _doc_stats:
+                elements.append(Paragraph("Document Coverage & Verification Status", normal_style))
+                elements.append(Spacer(1, 0.08 * inch))
+                _ds_data = [["Document Type", "Suppliers", "Total Uploaded", "Verified", "Pending", "Rejected"]]
+                for _r in sorted(_doc_stats, key=lambda r: r.get("supplier_count", 0), reverse=True):
+                    _ds_data.append([
+                        (_r.get("document_type") or "").replace("_", " ").title()[:35],
+                        str(_r.get("supplier_count", 0)),
+                        str(_r.get("total_uploads", 0)),
+                        str(_r.get("verified_count", 0)),
+                        str(_r.get("pending_count", 0)),
+                        str(_r.get("rejected_count", 0)),
+                    ])
+                _ds_tbl = Table(_ds_data, colWidths=[3.0*inch, 0.9*inch, 1.0*inch, 0.9*inch, 0.9*inch, 0.9*inch], repeatRows=1)
+                _ds_tbl.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0f766e')),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, 0), 8),
+                    ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+                    ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                    ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                    ('FONTSIZE', (0, 1), (-1, -1), 8),
+                    ('TOPPADDING', (0, 0), (-1, -1), 4),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                    ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#d1d5db')),
+                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#ecfeff')]),
+                ]))
+                elements.append(_ds_tbl)
+                elements.append(Spacer(1, 0.2 * inch))
 
             elements.append(PageBreak())
 
         # ── Supplier list ─────────────────────────────────────────────────
         if include_supplier_list:
-            table_data = [
-                ['Company Name', 'Category', 'Location', 'Contact', 'Email', 'Status', 'Years in Business', 'Registered']
+            elements.append(Paragraph("Approved Supplier Directory", heading_style))
+            elements.append(Spacer(1, 0.15 * inch))
+
+            _hdr_para = ParagraphStyle(
+                'HdrCell', fontSize=8, fontName='Helvetica-Bold',
+                textColor=colors.white, alignment=TA_CENTER, leading=10,
+            )
+            table_data = [[
+                Paragraph('Company Name', _hdr_para),
+                Paragraph('Business Categories', _hdr_para),
+                Paragraph('Location', _hdr_para),
+                Paragraph('Contact Person', _hdr_para),
+                Paragraph('Email', _hdr_para),
+                Paragraph('Status', _hdr_para),
+                Paragraph('Yrs', _hdr_para),
+                Paragraph('Registered', _hdr_para),
+            ]]
+            _tbl_style = [
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0066cc')),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('ALIGN', (2, 1), (-1, -1), 'CENTER'),
+                ('ALIGN', (0, 1), (1, -1), 'LEFT'),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                ('LEFTPADDING', (0, 0), (-1, -1), 5),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 5),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#d1d5db')),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f0f7ff')]),
+                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 1), (-1, -1), 8),
+                ('TEXTCOLOR', (0, 1), (-1, -1), colors.HexColor('#1f2937')),
             ]
-            for supplier in suppliers:
+            for i, supplier in enumerate(suppliers, 1):
+                cats = supplier.get('business_categories') or [supplier.get('business_category') or 'N/A']
+                cat_text = '\n'.join(c.replace('_', ' ').title() for c in cats)
+                status = (supplier.get('status') or 'N/A').upper()
                 row = [
-                    supplier.get('company_name', 'N/A')[:30],
-                    (supplier.get('business_category') or 'N/A').replace('_', ' ').title()[:20],
-                    f"{supplier.get('city', 'N/A')}, {supplier.get('country', 'N/A')}"[:25],
-                    supplier.get('contact_person_name', 'N/A')[:20],
-                    supplier.get('email', 'N/A')[:30],
-                    (supplier.get('status') or 'N/A').upper()[:15],
+                    Paragraph(supplier.get('company_name', 'N/A'), cell_style),
+                    Paragraph(cat_text, cat_cell_style),
+                    f"{supplier.get('city', '') or ''}, {supplier.get('country', '') or ''}"[:22],
+                    (supplier.get('contact_person_name', '') or '')[:20],
+                    (supplier.get('email', '') or '')[:28],
+                    status,
                     str(supplier.get('years_in_business', 'N/A')),
                     format_cat_datetime(supplier.get('created_at'), '%Y-%m-%d') if supplier.get('created_at') else 'N/A',
                 ]
                 table_data.append(row)
+                status_color = STATUS_COLORS.get(status, colors.HexColor('#6b7280'))
+                _tbl_style.append(('TEXTCOLOR', (5, i), (5, i), status_color))
+                _tbl_style.append(('FONTNAME', (5, i), (5, i), 'Helvetica-Bold'))
 
-            table = Table(table_data, repeatRows=1)
-            table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0066cc')),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 9),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                ('TOPPADDING', (0, 0), (-1, 0), 12),
-                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
-                ('TEXTCOLOR', (0, 1), (-1, -1), colors.HexColor('#1f2937')),
-                ('ALIGN', (0, 1), (-1, -1), 'LEFT'),
-                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-                ('FONTSIZE', (0, 1), (-1, -1), 8),
-                ('TOPPADDING', (0, 1), (-1, -1), 6),
-                ('BOTTOMPADDING', (0, 1), (-1, -1), 6),
-                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#d1d5db')),
-                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f0f7ff')]),
-            ]))
+            _col_widths = [1.85*inch, 2.3*inch, 1.0*inch, 1.1*inch, 1.85*inch, 0.75*inch, 0.5*inch, 0.8*inch]
+            table = Table(table_data, repeatRows=1, colWidths=_col_widths)
+            table.setStyle(TableStyle(_tbl_style))
             elements.append(table)
 
         # Build PDF
@@ -802,12 +907,6 @@ class ReportService:
             sort_by=sort_by, sort_order=sort_order,
         )
 
-        # Fetch sustainability/QC document submissions for the filtered suppliers
-        _xl_supplier_ids = [s["id"] for s in suppliers]
-        sustainability_docs = await db.get_sustainability_doc_submissions(
-            supplier_ids=_xl_supplier_ids if _xl_supplier_ids else None
-        )
-
         # Create workbook
         wb = Workbook()
 
@@ -826,9 +925,8 @@ class ReportService:
             bottom=Side(style='thin', color='D1D5DB'),
         )
 
-        # Pre-compute sustainability data (used by both sheets)
+        # Pre-compute ESG metrics
         _xl_enhanced_data = await self._build_enhanced_sustainability_metrics(suppliers)
-        _xl_sustain_data = self._build_sustainability_by_category(suppliers, sustainability_docs)
 
         # ===== Sheet 1: Summary =====
         if include_summary:
@@ -883,8 +981,8 @@ class ReportService:
             row_offset += 1
             category_counts: dict = {}
             for supplier in suppliers:
-                cv = supplier.get('business_category', 'Unknown')
-                category_counts[cv] = category_counts.get(cv, 0) + 1
+                for cv in (supplier.get('business_categories') or [supplier.get('business_category') or 'Unknown']):
+                    category_counts[cv] = category_counts.get(cv, 0) + 1
             for col, hdr in enumerate(['Business Category', 'Count', 'Percentage'], 1):
                 cell = ws_summary.cell(row=row_offset, column=col, value=hdr)
                 cell.fill = header_fill
@@ -929,19 +1027,7 @@ class ReportService:
 
         # ===== Sheet 2: Sustainability & ESG Metrics =====
         if include_sustainability:
-            _SUSTAIN_DISPLAY = {
-                'FOOD_SAFETY_CERTIFICATION': 'Food Safety Certification',
-                'GOOD_AGRICULTURAL_PRACTICES': 'Good Agricultural Practices (GAP)',
-                'ISO_14000': 'ISO 14000 (Environmental Management)',
-                'ISO_45000': 'ISO 45000 (Occupational Health & Safety)',
-                'INDUSTRY_CERTIFICATION': 'Industry Certification',
-            }
             sustain_fill = PatternFill(start_color="16A34A", end_color="16A34A", fill_type="solid")
-            _s2 = _xl_sustain_data["total_submitters"]
-            _t2 = _xl_sustain_data["total_suppliers"]
-            _r2 = _xl_sustain_data["overall_rate"]
-            _by_cat = _xl_sustain_data["by_category"]
-            _status_scope = ", ".join([s.value for s in status]) if status else "ALL"
 
             ws_sustain = wb.create_sheet("Sustainability Report")
             ws_sustain.cell(row=1, column=1, value="Sustainability & ESG Metrics").font = Font(bold=True, size=16, color="0F766E")
@@ -958,7 +1044,7 @@ class ReportService:
             ws_sustain.cell(
                 row=5,
                 column=1,
-                value=f"Scope: {_xl_enhanced_data['total_suppliers']} suppliers in this report (status filter: {_status_scope}).",
+                value=f"Scope: {_xl_enhanced_data['total_suppliers']} APPROVED suppliers.",
             ).font = Font(bold=True, color="1F2937")
 
             # Enhanced ESG metric table
@@ -1004,72 +1090,65 @@ class ReportService:
                     for _ci in (1, 2, 3):
                         ws_sustain.cell(row=_ri, column=_ci).fill = PatternFill(start_color="EFF6FF", end_color="EFF6FF", fill_type="solid")
 
-            # Tier 1 — Legacy optional certification coverage by category
-            _legacy_start = _size_start + 2 + len(_xl_enhanced_data["business_size_distribution"]) + 2
-            ws_sustain.cell(row=_legacy_start, column=1, value="Optional Certification Submissions (Legacy View)").font = Font(bold=True, size=12)
-            for _ci, _hdr in enumerate(['Business Category', 'Suppliers in Category', 'With Sustainability Docs', 'Coverage'], 1):
-                cell = ws_sustain.cell(row=_legacy_start + 1, column=_ci, value=_hdr)
-                cell.fill = sustain_fill
+            # ── Category Compliance ───────────────────────────────────────────
+            _xl_cat_compl = await db.get_category_compliance_stats(status="APPROVED")
+            _xl_cat_compl = [r for r in _xl_cat_compl if r.get("total_suppliers", 0) > 0]
+
+            _compl_start = _size_start + 2 + len(_xl_enhanced_data["business_size_distribution"]) + 2
+            ws_sustain.cell(row=_compl_start, column=1, value="Category Compliance Overview").font = Font(bold=True, size=12)
+            _cc_hdrs = ["Business Category", "Total", "Mand. Met", "Mand. Missing",
+                        "Full Compliance", "Med Risk", "High Risk", "Pending", "Compliance %"]
+            for _ci, _hdr in enumerate(_cc_hdrs, 1):
+                cell = ws_sustain.cell(row=_compl_start + 1, column=_ci, value=_hdr)
+                cell.fill = PatternFill(start_color="1D4ED8", end_color="1D4ED8", fill_type="solid")
                 cell.font = header_font
                 cell.alignment = header_alignment
                 cell.border = border
 
-            for _ri, _bc in enumerate(_by_cat, start=_legacy_start + 2):
-                for _ci, _val in enumerate([_bc["display"], _bc["total"],
-                                            _bc["submitters"] if _bc["submitters"] > 0 else 0,
-                                            f"{_bc['rate']:.1f}%"], 1):
+            for _ri, _r in enumerate(_xl_cat_compl, start=_compl_start + 2):
+                _vals = [
+                    _r["category"].replace("_", " ").title(),
+                    _r["total_suppliers"], _r["mandatory_met_count"], _r["mandatory_missing_count"],
+                    _r["full_compliance_count"], _r["medium_risk_count"], _r["high_risk_count"],
+                    _r["pending_count"], f"{_r['full_compliance_pct']:.1f}%",
+                ]
+                for _ci, _val in enumerate(_vals, 1):
                     cell = ws_sustain.cell(row=_ri, column=_ci, value=_val)
                     cell.border = border
                     cell.alignment = Alignment(vertical="center")
-                    if _bc["submitters"] == 0:
-                        cell.font = Font(color="9CA3AF")
-                    elif _ri % 2 == 0:
-                        cell.fill = PatternFill(start_color="F0FDF4", end_color="F0FDF4", fill_type="solid")
+                    if _ri % 2 == 0:
+                        cell.fill = PatternFill(start_color="EFF6FF", end_color="EFF6FF", fill_type="solid")
+                    if _ci == 4 and isinstance(_val, int) and _val > 0:
+                        cell.font = Font(color="DC2626", bold=True)
+                    if _ci == 7 and isinstance(_val, int) and _val > 0:
+                        cell.font = Font(color="DC2626")
 
-            _gt_row = _legacy_start + 2 + len(_by_cat)
-            for _ci, _val in enumerate(["All Categories", _t2, _s2, f"{_r2:.1f}%"], 1):
-                cell = ws_sustain.cell(row=_gt_row, column=_ci, value=_val)
-                cell.font = Font(bold=True)
-                cell.fill = PatternFill(start_color="DCFCE7", end_color="DCFCE7", fill_type="solid")
+            # ── Document Type Stats ───────────────────────────────────────────
+            _xl_doc_stats = await db.get_document_type_stats()
+            _doc_start = _compl_start + 2 + len(_xl_cat_compl) + 2
+            ws_sustain.cell(row=_doc_start, column=1, value="Document Coverage & Verification Status").font = Font(bold=True, size=12)
+            _ds_hdrs = ["Document Type", "Suppliers", "Total Uploaded", "Verified", "Pending", "Rejected"]
+            for _ci, _hdr in enumerate(_ds_hdrs, 1):
+                cell = ws_sustain.cell(row=_doc_start + 1, column=_ci, value=_hdr)
+                cell.fill = PatternFill(start_color="0F766E", end_color="0F766E", fill_type="solid")
+                cell.font = header_font
+                cell.alignment = header_alignment
                 cell.border = border
 
-            # Tier 2 — Per-category detail
-            _active_cats = [_bc for _bc in _by_cat if _bc["submitters"] > 0]
-            _detail_start = _gt_row + 3
-            if _active_cats:
-                ws_sustain.cell(row=_detail_start - 1, column=1, value="Breakdown by Category").font = Font(bold=True, size=12)
-                _det_hdrs = ['Company Name', 'Certification Document', 'Verification Status', 'Date Submitted']
-                _cur = _detail_start
-                for _bc in _active_cats:
-                    _label = f"{_bc['display']}  \u2014  {_bc['submitters']} of {_bc['total']} suppliers ({_bc['rate']:.1f}%)"
-                    c = ws_sustain.cell(row=_cur, column=1, value=_label)
-                    c.font = Font(bold=True, color="15803D")
-                    c.fill = PatternFill(start_color="BBFFD0", end_color="BBFFD0", fill_type="solid")
-                    ws_sustain.merge_cells(start_row=_cur, start_column=1, end_row=_cur, end_column=4)
-                    _cur += 1
-                    for _ci, _hdr in enumerate(_det_hdrs, 1):
-                        cell = ws_sustain.cell(row=_cur, column=_ci, value=_hdr)
-                        cell.fill = PatternFill(start_color="D1FAE5", end_color="D1FAE5", fill_type="solid")
-                        cell.font = Font(bold=True, size=10)
-                        cell.border = border
-                    _cur += 1
-                    for _d in _bc["docs"]:
-                        for _ci, _val in enumerate([
-                            _d["supplier"].get("company_name") or "Unknown",
-                            _SUSTAIN_DISPLAY.get(_d["document_type"], _d["document_type"].replace("_", " ").title()),
-                            (_d.get("verification_status") or "PENDING").upper(),
-                            self._format_date(_d.get("uploaded_at")),
-                        ], 1):
-                            cell = ws_sustain.cell(row=_cur, column=_ci, value=_val)
-                            cell.border = border
-                            cell.alignment = Alignment(vertical="center", wrap_text=True)
-                        _cur += 1
-                    _cur += 1  # blank row between categories
-            else:
-                c = ws_sustain.cell(row=_detail_start, column=1, value="No sustainability documents have been submitted.")
-                c.font = Font(italic=True, color="6B7280")
+            for _ri, _r in enumerate(sorted(_xl_doc_stats, key=lambda r: r.get("supplier_count", 0), reverse=True), start=_doc_start + 2):
+                _vals = [
+                    (_r.get("document_type") or "").replace("_", " ").title(),
+                    _r.get("supplier_count", 0), _r.get("total_uploads", 0),
+                    _r.get("verified_count", 0), _r.get("pending_count", 0), _r.get("rejected_count", 0),
+                ]
+                for _ci, _val in enumerate(_vals, 1):
+                    cell = ws_sustain.cell(row=_ri, column=_ci, value=_val)
+                    cell.border = border
+                    cell.alignment = Alignment(vertical="center", wrap_text=True)
+                    if _ri % 2 == 0:
+                        cell.fill = PatternFill(start_color="ECFEFF", end_color="ECFEFF", fill_type="solid")
 
-            for _ci, _w in enumerate([35, 20, 42, 22], 1):
+            for _ci, _w in enumerate([35, 12, 14, 14, 14, 14, 14, 12, 14], 1):
                 ws_sustain.column_dimensions[get_column_letter(_ci)].width = _w
 
         # ===== Sheet 3: Supplier Details =====
@@ -1091,7 +1170,7 @@ class ReportService:
             for row_num, supplier in enumerate(suppliers, 2):
                 data = [
                     supplier.get('company_name', ''),
-                    (supplier.get('business_category') or '').replace('_', ' ').title(),
+                    ', '.join(c.replace('_', ' ').title() for c in (supplier.get('business_categories') or [supplier.get('business_category') or ''])),
                     supplier.get('registration_number', ''),
                     supplier.get('tax_id', ''),
                     supplier.get('years_in_business', ''),

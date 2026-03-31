@@ -151,26 +151,27 @@ async def get_current_vendor(
 ) -> dict:
     """
     Dependency to get the current authenticated vendor/supplier user.
-    
-    Args:
-        credentials: Bearer token credentials
-        
-    Returns:
-        Supplier user data from database
-        
-    Raises:
-        HTTPException: If token is invalid or user not found
+    Accepts tokens with role == "vendor" (7-day vendor tokens) issued by
+    the vendor auth routes.
     """
     token = credentials.credentials
     payload = verify_access_token(token)
-    
+
     if payload is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
+    # Reject admin tokens presented to vendor endpoints
+    if payload.get("role") != "vendor":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token role",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     supplier_id = payload.get("sub")
     if not supplier_id:
         raise HTTPException(

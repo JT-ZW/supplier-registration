@@ -8,10 +8,13 @@ from typing import List, Optional
 from uuid import uuid4
 from pydantic import UUID4, BaseModel
 import asyncio
+import secrets
+import string
+import traceback
 from fastapi import APIRouter, HTTPException, status, Depends, Request, Query, Body
 
 from ...db.supabase import db
-from ...services.audit_service import audit_service, AuditAction
+from ...services.audit_service import audit_service
 from ...api.deps import get_client_ip
 from ...models import (
     AdminLoginRequest,
@@ -51,6 +54,7 @@ from ...core.email import email_service, EmailTemplate
 from ...core.config import settings
 from ...core.storage import storage_service
 from ...core.cache_invalidation import invalidate_analytics_cache
+from ...core.logger import logger
 
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
@@ -97,7 +101,7 @@ async def login(request: AdminLoginRequest, http_request: Request):
     # Verify password
     if not verify_password(request.password, admin["password_hash"]):
         # Log failed login attempt
-        audit_service.log_login(
+        await audit_service.log_login(
             admin_id=admin["id"],
             admin_email=admin["email"],
             ip_address=get_client_ip(http_request),
@@ -237,8 +241,6 @@ async def admin_register_supplier(
     admin can upload documents using the existing document endpoints before optionally
     submitting on behalf. If submit_immediately is True, status is set to SUBMITTED.
     """
-    import secrets
-    import string
     from ...models.enums import get_supplier_type, compute_business_size, compute_esg_flags
 
     # Duplicate email check
@@ -373,7 +375,7 @@ async def admin_register_supplier(
             to_name=supplier["contact_person_name"]
         )
     except Exception as e:
-        print(f"Failed to send credentials email to {supplier['email']}: {e}")
+        logger.warning("Failed to send credentials email to %s: %s", supplier['email'], e)
 
     await invalidate_analytics_cache()
 
@@ -411,7 +413,17 @@ async def list_suppliers(
         order_by=filters.sort_by,
         ascending=filters.ascending,
     )
-    
+
+    # Enrich each supplier with all their categories from supplier_categories
+    if result["items"]:
+        supplier_ids = [s["id"] for s in result["items"]]
+        all_cats = db.client.table("supplier_categories").select("supplier_id, category").in_("supplier_id", supplier_ids).execute()
+        cats_by_supplier: dict = {}
+        for row in (all_cats.data or []):
+            cats_by_supplier.setdefault(row["supplier_id"], []).append(row["category"])
+        for s in result["items"]:
+            s["business_categories"] = cats_by_supplier.get(s["id"]) or [s["business_category"]]
+
     return SupplierListResponse(**result)
 
 
@@ -467,8 +479,12 @@ async def get_supplier_details(
         details={"view_timestamp": datetime.utcnow().isoformat()},
         ip_address=get_client_ip(http_request)
     )
-    
-    return SupplierResponse(**supplier)
+
+    # Fetch all categories from supplier_categories table (supports multi-category)
+    cat_rows = await db.get_supplier_categories(supplier_id)
+    biz_categories = [r["category"] for r in cat_rows] if cat_rows else [supplier["business_category"]]
+
+    return SupplierResponse(**{**supplier, "business_categories": biz_categories})
 
 
 @router.get(
@@ -491,7 +507,7 @@ async def get_supplier_trade_references(
 
     items = await db.get_trade_references_by_supplier(supplier_id)
     return TradeReferenceListResponse(
-        supplierId=supplier_id,
+        supplier_id=supplier_id,
         items=items,
         total=len(items),
     )
@@ -659,10 +675,17 @@ async def review_application(
                 to_name=supplier["contact_person_name"]
             )
     except Exception as e:
-        print(f"Failed to send email: {e}")
+        logger.warning("Failed to send email: %s", e)
 
     await invalidate_analytics_cache()
-    
+
+    # Keep per-category compliance current whenever a supplier's status changes.
+    # This is cheap and ensures the sustainability dashboard reflects approval immediately.
+    try:
+        await db.recompute_supplier_category_compliance(supplier_id)
+    except Exception as compliance_err:
+        logger.warning("compliance recompute skipped for %s: %s", supplier_id, compliance_err)
+
     return SuccessResponse(
         success=True,
         message=f"Application status updated to {new_status}"
@@ -1078,11 +1101,9 @@ async def request_more_info(
             },
             to_name=supplier["contact_person_name"]
         )
-        print(f"More info request email sent to vendor: {supplier['email']}")
+        logger.info("More info request email sent to vendor: %s", supplier['email'])
     except Exception as e:
-        import traceback
-        print(f"Failed to send more info email: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
+        logger.exception("Failed to send more info email: %s", e)
     
     return SuccessResponse(
         success=True,
@@ -1136,7 +1157,7 @@ async def verify_document(
     try:
         await db.recompute_supplier_category_compliance(document["supplier_id"])
     except Exception as compliance_err:
-        print(f"⚠️  compliance recompute skipped for {document['supplier_id']}: {compliance_err}")
+        logger.warning("compliance recompute skipped for %s: %s", document['supplier_id'], compliance_err)
     
     # Log document verification with new audit service
     audit_action = AuditAction.DOCUMENT_VERIFIED if request.status == DocumentVerificationStatus.VERIFIED else AuditAction.DOCUMENT_REJECTED
@@ -1202,7 +1223,7 @@ async def verify_document(
                     )
                 )
         except Exception as status_err:
-            print(f"⚠️  supplier portfolio status recompute skipped: {status_err}")
+            logger.warning("supplier portfolio status recompute skipped: %s", status_err)
 
     await invalidate_analytics_cache()
 
@@ -1235,27 +1256,26 @@ async def delete_supplier(
     documents = await db.get_documents_by_supplier(supplier_id)
     
     # Delete documents from storage (don't fail if files don't exist)
-    from ...core.storage import storage_service
     for doc in documents:
         try:
             storage_service.delete_file(doc["s3_key"])
-            print(f"✅ Deleted file: {doc['s3_key']}")
+            logger.info("Deleted file: %s", doc['s3_key'])
         except Exception as e:
             # Log but don't fail - file might not exist in storage
-            print(f"⚠️ Could not delete file {doc['s3_key']}: {str(e)}")
+            logger.warning("Could not delete file %s: %s", doc['s3_key'], e)
     
     # Delete supplier from database (this will cascade delete documents due to foreign key)
     await db.delete_supplier(supplier_id)
     
     # Log the action
     await db.create_audit_log({
-        "id": str(uuid4()),
         "admin_id": current_admin["id"],
-        "admin_email": current_admin["email"],
+        "user_type": "admin",
+        "user_email": current_admin["email"],
         "action": AdminAction.DELETE_SUPPLIER.value,
-        "target_type": "supplier",
-        "target_id": supplier_id,
-        "details": {"company_name": supplier["company_name"], "email": supplier["email"]},
+        "resource_type": "supplier",
+        "resource_id": supplier_id,
+        "metadata": {"company_name": supplier["company_name"], "email": supplier["email"]},
         "ip_address": get_client_ip(http_request),
     })
 
@@ -1406,7 +1426,7 @@ async def bulk_supplier_action(
         except Exception as e:
             failed += 1
             errors.append(f"Error processing {supplier_id}: {str(e)}")
-            print(f"Bulk action error for {supplier_id}: {str(e)}")
+            logger.warning("Bulk action error for %s: %s", supplier_id, e)
 
     if successful > 0:
         await invalidate_analytics_cache()
@@ -1512,7 +1532,7 @@ async def bulk_document_verification(
         except Exception as e:
             failed += 1
             errors.append(f"Error processing document {doc_id}: {str(e)}")
-            print(f"Bulk document verification error for {doc_id}: {str(e)}")
+            logger.warning("Bulk document verification error for %s: %s", doc_id, e)
 
     if successful > 0:
         await invalidate_analytics_cache()

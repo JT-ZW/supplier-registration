@@ -2,6 +2,7 @@
 Supabase database client and utilities.
 """
 
+import asyncio
 from datetime import datetime, timedelta, date
 from typing import Optional, Dict, Any, List
 from postgrest import SyncPostgrestClient
@@ -137,8 +138,14 @@ class Database:
         if status:
             query = query.eq("status", status)
         if category:
-            query = query.eq("business_category", category)
-        
+            # Use supplier_categories table to support multi-category filtering
+            cat_ids_result = self._client.table("supplier_categories").select("supplier_id").eq("category", category).execute()
+            cat_ids = [r["supplier_id"] for r in (cat_ids_result.data or [])]
+            if cat_ids:
+                query = query.in_("id", cat_ids)
+            else:
+                return {"items": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
+
         # Advanced search filters
         if company_name:
             query = query.ilike("company_name", f"%{company_name}%")
@@ -372,9 +379,37 @@ class Database:
         return result.data
     
     async def get_supplier_count_by_category(self) -> List[Dict[str, Any]]:
-        """Get supplier count grouped by category."""
-        result = self._client.rpc("get_supplier_count_by_category").execute()
-        return result.data
+        """Get supplier count grouped by category using supplier_categories table (multi-category aware)."""
+        cats_result = self._client.table("supplier_categories").select("supplier_id, category").execute()
+        cat_rows = cats_result.data or []
+        if not cat_rows:
+            return []
+
+        supplier_ids = list({r["supplier_id"] for r in cat_rows})
+        sup_result = self._client.table("suppliers").select("id, status").in_("id", supplier_ids).execute()
+        status_map = {s["id"]: s["status"] for s in (sup_result.data or [])}
+
+        category_map: Dict[str, Dict[str, Any]] = {}
+        for row in cat_rows:
+            cat = row["category"]
+            sup_status = status_map.get(row["supplier_id"], "")
+            if cat not in category_map:
+                category_map[cat] = {
+                    "category": cat,
+                    "total_count": 0,
+                    "approved_count": 0,
+                    "pending_count": 0,
+                    "rejected_count": 0,
+                }
+            category_map[cat]["total_count"] += 1
+            if sup_status == "APPROVED":
+                category_map[cat]["approved_count"] += 1
+            elif sup_status in ("SUBMITTED", "INCOMPLETE", "UNDER_REVIEW", "NEED_MORE_INFO"):
+                category_map[cat]["pending_count"] += 1
+            elif sup_status == "REJECTED":
+                category_map[cat]["rejected_count"] += 1
+
+        return sorted(category_map.values(), key=lambda x: x["total_count"], reverse=True)
     
     async def get_location_stats(self) -> List[Dict[str, Any]]:
         """Get supplier count grouped by city."""
@@ -869,6 +904,7 @@ class Database:
                 "mandatory_missing_categories": 0,
                 "non_excluded_categories": 0,
                 "mandatory_statutory_met": False,
+                "mandatory_statutory_has_expired": False,
             }
 
         documents = await self.get_documents_by_supplier(supplier_id)
@@ -914,6 +950,40 @@ class Database:
         statutory_docs = get_statutory_documents(supplier_type)
         mandatory_statutory_met = all(doc_type in valid_verified_doc_types for doc_type in statutory_docs)
 
+        # Check whether any statutory doc is *actually expired* (vs. just unverified/pending).
+        # Suspension is only warranted for expired docs; missing/unverified → COMPLIANCE_REQUIRED.
+        mandatory_statutory_has_expired = False
+        statutory_doc_set = set(statutory_docs)
+        for doc in documents:
+            if doc.get("is_archived") is True:
+                continue
+            raw_type = doc.get("document_type")
+            try:
+                doc_type = DocumentType(raw_type)
+            except Exception:
+                continue
+            if doc_type not in statutory_doc_set:
+                continue
+            # Already flagged as EXPIRED by the daily expiry flag job
+            if doc.get("verification_status") == "EXPIRED":
+                mandatory_statutory_has_expired = True
+                break
+            # Verified doc whose expiry date has passed (belt-and-suspenders check)
+            if doc.get("verification_status") == "VERIFIED" and doc_type in expiry_required_types:
+                _exp_value = doc.get("expiry_date")
+                if _exp_value:
+                    _exp_date = None
+                    if isinstance(_exp_value, date):
+                        _exp_date = _exp_value
+                    elif isinstance(_exp_value, str):
+                        try:
+                            _exp_date = date.fromisoformat(_exp_value[:10])
+                        except ValueError:
+                            pass
+                    if _exp_date and _exp_date < today:
+                        mandatory_statutory_has_expired = True
+                        break
+
         categories = await self.get_supplier_categories(supplier_id)
         allowed_categories: List[str] = []
         blocked_categories: List[str] = []
@@ -949,6 +1019,7 @@ class Database:
             "mandatory_missing_categories": len(blocked_categories),
             "non_excluded_categories": non_excluded_categories,
             "mandatory_statutory_met": mandatory_statutory_met,
+            "mandatory_statutory_has_expired": mandatory_statutory_has_expired,
         }
 
     async def delete_supplier_category(self, supplier_id: str, category: str) -> bool:
@@ -1088,12 +1159,16 @@ class Database:
         return updated_rows
 
     async def recompute_supplier_portfolio_status(self, supplier_id: str) -> Dict[str, Any]:
-        """Recompute supplier-level status from statutory + category compliance outcomes.
+        """Recompute supplier-level status from statutory compliance outcomes only.
 
         Policy:
-        - Missing statutory mandatory requirements -> SUSPENDED.
-        - Statutory met, but one or more categories missing mandatory docs -> COMPLIANCE_REQUIRED.
-        - Statutory met and all non-excluded categories at least mandatory-compliant -> APPROVED.
+        - Expired statutory mandatory documents -> SUSPENDED.
+        - Statutory mandatory docs missing or unverified (not expired) -> COMPLIANCE_REQUIRED.
+        - Statutory requirements met -> APPROVED (regardless of category-doc status).
+
+        Category-level doc issues (expired or missing category docs) are tracked in
+        supplier_categories.compliance_status and surfaced as compliance flags, but they
+        do NOT demote a supplier from APPROVED. Only statutory doc expiry triggers suspension.
         """
         from ..models.enums import SupplierStatus
 
@@ -1118,6 +1193,7 @@ class Database:
 
         access_summary = await self.get_supplier_category_access_summary(supplier_id)
         mandatory_statutory_met = bool(access_summary.get("mandatory_statutory_met"))
+        mandatory_statutory_has_expired = bool(access_summary.get("mandatory_statutory_has_expired"))
         categories = await self.get_supplier_categories(supplier_id)
         mandatory_met_count = int(access_summary.get("mandatory_met_categories", 0) or 0)
         mandatory_missing_count = int(access_summary.get("mandatory_missing_categories", 0) or 0)
@@ -1128,17 +1204,26 @@ class Database:
         new_status = current_status
         reason = "no_change"
         if not mandatory_statutory_met:
-            new_status = SupplierStatus.SUSPENDED.value
-            reason = "statutory_mandatory_missing_or_expired"
-        elif non_excluded_total == 0:
-            new_status = SupplierStatus.COMPLIANCE_REQUIRED.value
-            reason = "no_scored_categories"
-        elif mandatory_missing_count > 0:
-            new_status = SupplierStatus.COMPLIANCE_REQUIRED.value
-            reason = "category_mandatory_missing"
+            if mandatory_statutory_has_expired:
+                # One or more statutory docs have expired — suspend regardless of current status
+                new_status = SupplierStatus.SUSPENDED.value
+                reason = "statutory_documents_expired"
+            elif current_status == SupplierStatus.APPROVED.value:
+                # Docs are missing/unverified but the admin already explicitly approved this
+                # supplier. Do NOT downgrade — only expiry can touch an APPROVED supplier.
+                new_status = SupplierStatus.APPROVED.value
+                reason = "no_change_approved_statutory_unverified"
+            else:
+                # Supplier is already COMPLIANCE_REQUIRED or SUSPENDED with no expired docs —
+                # keep at COMPLIANCE_REQUIRED so they know docs are needed.
+                new_status = SupplierStatus.COMPLIANCE_REQUIRED.value
+                reason = "statutory_mandatory_missing_or_unverified"
         else:
+            # All statutory requirements are satisfied → APPROVED.
+            # Category-level doc issues are tracked per-category and surfaced as compliance
+            # flags only; they never remove a supplier from the approved list.
             new_status = SupplierStatus.APPROVED.value
-            reason = "all_mandatory_requirements_met"
+            reason = "statutory_requirements_met"
 
         changed = new_status != current_status
 
@@ -1152,7 +1237,7 @@ class Database:
                 update_data["suspended_at"] = supplier.get("suspended_at") or datetime.utcnow().isoformat()
                 update_data["suspension_reason"] = (
                     "Supplier is suspended because one or more statutory mandatory "
-                    "documents are missing, unverified, or expired."
+                    "documents have expired."
                 )
                 if "suspension_triggered_by" in supplier:
                     update_data["suspension_triggered_by"] = "SYSTEM"
@@ -1191,19 +1276,27 @@ class Database:
         result = query.execute()
         suppliers = result.data or []
 
-        recomputed_count = 0
-        for supplier in suppliers:
-            supplier_id = supplier.get("id")
-            if not supplier_id:
-                continue
-            try:
-                await self.recompute_supplier_category_compliance(supplier_id)
-                await self.recompute_supplier_portfolio_status(supplier_id)
-                recomputed_count += 1
-            except Exception:
-                continue
+        # Process suppliers in parallel (capped at 8 concurrent workers) instead of
+        # the previous sequential-await loop that caused one DB round-trip per supplier.
+        semaphore = asyncio.Semaphore(8)
 
-        return recomputed_count
+        async def _recompute_one(supplier_id: str) -> bool:
+            async with semaphore:
+                try:
+                    await self.recompute_supplier_category_compliance(supplier_id)
+                    # recompute_supplier_portfolio_status is intentionally NOT called here.
+                    # Only the daily expiry job (expiry_service.py) may trigger supplier
+                    # status changes. This function only updates supplier_categories rows,
+                    # never suppliers.status.
+                    return True
+                except Exception:
+                    return False
+
+        results = await asyncio.gather(
+            *[_recompute_one(s["id"]) for s in suppliers if s.get("id")],
+            return_exceptions=False,
+        )
+        return sum(1 for ok in results if ok)
 
     async def recompute_portfolio_status_for_suppliers(
         self,
@@ -1356,13 +1449,20 @@ class Database:
         """Return category compliance matrix with full category coverage and mandatory summary."""
         from ..models.enums import BusinessCategory
 
+        # When no explicit status filter is given, scope to approved/active suppliers only.
+        # UNDER_REVIEW / SUBMITTED suppliers have no verified docs yet so they
+        # distort the compliance percentages on the sustainability dashboard.
+        ACTIVE_SCOPE = ["APPROVED", "COMPLIANCE_REQUIRED", "SUSPENDED"]
+
         supplier_query = self._client.table("suppliers").select("id,business_category")
+        if status:
+            supplier_query = supplier_query.eq("status", status)
+        else:
+            supplier_query = supplier_query.in_("status", ACTIVE_SCOPE)
         if country:
             supplier_query = supplier_query.ilike("country", f"%{country}%")
         if business_size:
             supplier_query = supplier_query.eq("business_size", business_size)
-        if status:
-            supplier_query = supplier_query.eq("status", status)
 
         suppliers_result = supplier_query.execute()
         suppliers = suppliers_result.data or []

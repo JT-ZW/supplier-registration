@@ -139,6 +139,7 @@ class VendorUserResponse(BaseModel):
     email: str
     phone: str
     business_category: str
+    business_categories: List[str] = []
     status: str
     is_active: bool
     created_at: datetime

@@ -25,7 +25,8 @@ DIRECT_UPDATE_FIELDS: Set[str] = {
     "city",
     "state_province",
     "postal_code",
-    "country",
+    "trade_references",
+    "key_persons_contacts",
 }
 
 # Fields that require admin approval before changes take effect
@@ -37,6 +38,12 @@ APPROVAL_REQUIRED_FIELDS: Set[str] = {
     "registration_number",
     "business_category",
     "years_in_business",
+    "country",
+    "employee_count",
+    "is_small_scale_farmer",
+    "business_categories",
+    "key_persons_directors",
+    "farmer_form",
 }
 
 # Fields that cannot be changed by vendors

@@ -168,7 +168,7 @@ async def create_admin_user(
     created_user = response.data[0]
     
     # Log user creation
-    audit_service.log_user_management(
+    await audit_service.log_user_management(
         admin_id=current_admin["id"],
         admin_email=current_admin["email"],
         action=AuditAction.USER_CREATED,
@@ -323,7 +323,7 @@ async def update_admin_user(
              AuditAction.USER_ACTIVATED if (request.is_active is True and not existing.data[0].get("is_active")) else \
              AuditAction.USER_UPDATED
     
-    audit_service.log_user_management(
+    await audit_service.log_user_management(
         admin_id=current_admin["id"],
         admin_email=current_admin["email"],
         action=action,
@@ -558,7 +558,13 @@ async def list_vendor_users(
     if status:
         query = query.eq("status", status)
     if category:
-        query = query.eq("business_category", category)
+        # Use supplier_categories for multi-category aware filtering
+        cat_ids_result = db.client.table("supplier_categories").select("supplier_id").eq("category", category).execute()
+        cat_ids = [r["supplier_id"] for r in (cat_ids_result.data or [])]
+        if cat_ids:
+            query = query.in_("id", cat_ids)
+        else:
+            return VendorUserListResponse(items=[], total=0, page=page, page_size=page_size, total_pages=0)
     if is_active is not None:
         query = query.eq("activity_status", "ACTIVE" if is_active else "INACTIVE")
     if search:
@@ -601,7 +607,14 @@ async def list_vendor_users(
             doc_counts[sid]["total"] += 1
             if doc["verification_status"] == "VERIFIED":
                 doc_counts[sid]["verified"] += 1
-    
+
+    # Fetch all categories for all vendors in one query
+    cats_by_vendor: dict = {}
+    if vendor_ids:
+        cats_resp = db.client.table("supplier_categories").select("supplier_id, category").in_("supplier_id", vendor_ids).execute()
+        for row in (cats_resp.data or []):
+            cats_by_vendor.setdefault(row["supplier_id"], []).append(row["category"])
+
     items = [
         VendorUserResponse(
             id=str(vendor["id"]),
@@ -610,6 +623,7 @@ async def list_vendor_users(
             email=vendor["email"],
             phone=vendor["phone"],
             business_category=vendor["business_category"],
+            business_categories=cats_by_vendor.get(vendor["id"]) or [vendor["business_category"]],
             status=vendor["status"],
             is_active=vendor.get("activity_status") == "ACTIVE",
             created_at=vendor["created_at"],

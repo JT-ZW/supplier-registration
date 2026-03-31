@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     # Application
     APP_NAME: str = "Supplier Registration System"
     APP_ENV: str = "development"
-    DEBUG: bool = True
+    DEBUG: bool = False
     API_VERSION: str = "v1"
     
     # Server
@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    VENDOR_JWT_EXPIRE_DAYS: int = 7  # Vendor portal tokens are long-lived (session-like)
     
     # AWS S3 (Optional - Using Supabase Storage as primary)
     AWS_ACCESS_KEY_ID: Optional[str] = None

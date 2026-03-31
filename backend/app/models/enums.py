@@ -265,6 +265,7 @@ NO_EXPIRY_DOCUMENT_TYPES: set = {
     DocumentType.CR14_OR_CR6,
     DocumentType.CR5,
     DocumentType.DIRECTORS_LIST,
+    DocumentType.ID_PASSPORT_COPY,
     DocumentType.PHYSICAL_ADDRESS_PROOF,
     DocumentType.OFFER_LETTER_TITLE_DEEDS,
     DocumentType.EVALUATION_FORM,
@@ -749,7 +750,20 @@ NO_EXPIRY_DOCUMENT_TYPES: set[DocumentType] = {
     DocumentType.COMPANY_PROFILE,
     DocumentType.CERTIFICATE_OF_INCORPORATION,
     DocumentType.CR14_OR_CR6,
+    DocumentType.CR5,
+    DocumentType.DIRECTORS_LIST,
+    DocumentType.ID_PASSPORT_COPY,
+    DocumentType.PHYSICAL_ADDRESS_PROOF,
+    DocumentType.OFFER_LETTER_TITLE_DEEDS,
     DocumentType.EVALUATION_FORM,
+    DocumentType.SHEQ_POLICY,
+    DocumentType.INTERNAL_QMS,
+    DocumentType.MATERIAL_SAFETY_DATA_SHEETS,
+    DocumentType.GOTS_BCI_CERT,
+    DocumentType.OEKO_TEX_CERT,
+    DocumentType.APPLICATION_FORM,
+    DocumentType.SAFETY_METHOD_STATEMENT,
+    DocumentType.RESCUE_PLAN,
 }
 
 EXPIRY_REQUIRED_DOCUMENT_TYPES: list[DocumentType] = [

@@ -25,7 +25,7 @@ class DocumentUploadRequest(BaseModel):
     filename: str = Field(..., alias="fileName", min_length=1, max_length=255, description="Original filename")
     content_type: str = Field(..., alias="contentType", description="MIME type of the file")
     file_size: int = Field(..., alias="fileSize", gt=0, description="File size in bytes")
-    expiry_date: Optional[date] = Field(None, alias="expiryDate", description="Expiry date as printed on the document (required for regulatory/compliance documents)")
+    expiry_date: Optional[date] = Field(None, alias="expiryDate", description="Expiry date as printed on the document (informational only at URL-generation stage).")
     
     model_config = {"populate_by_name": True}  # Accept both snake_case and camelCase
     
@@ -50,12 +50,16 @@ class DocumentUploadRequest(BaseModel):
             raise ValueError(f"Content type must be one of: {', '.join(allowed_types)}")
         return v
 
-    @model_validator(mode="after")
-    def validate_expiry_date_required(self):
-        """Require expiry date for document types that must be tracked for expiry."""
-        if self.document_type in EXPIRY_REQUIRED_TYPES and self.expiry_date is None:
-            raise ValueError(f"expiryDate is required for document type {self.document_type.value}")
-        return self
+    # NOTE: expiry_date is NOT validated here. The upload-url endpoint only generates
+    # a presigned storage URL and does not persist metadata. Expiry date validation
+    # is enforced after the file is physically uploaded, in DocumentMetadataCreateRequest.
+
+
+# Document types where the expiry date field is displayed on the frontend but is not
+# mandatory to submit (e.g. ID cards that may or may not carry an expiry date).
+_OPTIONAL_EXPIRY_TYPES = {
+    DocumentType.ID_PASSPORT_COPY,
+}
 
 
 class DocumentMetadataCreateRequest(BaseModel):
@@ -72,8 +76,18 @@ class DocumentMetadataCreateRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_expiry_date_required(self):
-        """Require expiry date for document types that must be tracked for expiry."""
-        if self.document_type in EXPIRY_REQUIRED_TYPES and self.expiry_date is None:
+        """Require expiry date for document types that must be tracked for expiry.
+
+        ID_PASSPORT_COPY is treated as optional-expiry because director ID/passport
+        uploads do not collect an expiry date at registration time (the admin can
+        record it during document verification).  All other expiry-required document
+        types must supply a date.
+        """
+        if (
+            self.document_type in EXPIRY_REQUIRED_TYPES
+            and self.document_type not in _OPTIONAL_EXPIRY_TYPES
+            and self.expiry_date is None
+        ):
             raise ValueError(f"expiryDate is required for document type {self.document_type.value}")
         return self
 

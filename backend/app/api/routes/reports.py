@@ -198,10 +198,12 @@ async def preview_supplier_report(
         
         for supplier in suppliers:
             s = supplier.get('status', 'Unknown')
-            c = supplier.get('business_category', 'Unknown')
-            
             status_counts[s] = status_counts.get(s, 0) + 1
-            category_counts[c] = category_counts.get(c, 0) + 1
+            # Count each category the supplier belongs to (multi-category aware)
+            sup_cats = supplier.get('business_categories') or [supplier.get('business_category', 'Unknown')]
+            for c in sup_cats:
+                if c:
+                    category_counts[c] = category_counts.get(c, 0) + 1
         
         return {
             "total_count": total_count,

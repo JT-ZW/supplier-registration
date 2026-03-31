@@ -28,6 +28,7 @@ from ...models import (
 from ...models.audit import AuditAction, AuditResourceType
 from ...core.storage import storage_service
 from ...core.config import settings
+from ...core.logger import logger
 
 
 router = APIRouter(prefix="/documents", tags=["Documents"])
@@ -58,14 +59,6 @@ async def get_upload_url(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You can only upload documents for your own application"
         )
-    # DEBUG: Log incoming request
-    print(f"🔍 DEBUG - Upload URL Request:")
-    print(f"   supplier_id: {request.supplier_id}")
-    print(f"   document_type: {request.document_type}")
-    print(f"   filename: {request.filename}")
-    print(f"   file_size: {request.file_size}")
-    print(f"   content_type: {request.content_type}")
-    
     # Validate supplier exists and is in correct status
     supplier = await db.get_supplier_by_id(request.supplier_id)
     if not supplier:
@@ -179,14 +172,11 @@ async def confirm_upload(
     
     # Optionally verify file exists in Storage
     # (This adds latency but ensures data integrity)
-    print(f"🔍 Verifying file exists in storage: {file_key}")
     if not storage_service.file_exists(file_key):
-        print(f"❌ File not found in storage: {file_key}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="File not found in storage. Please re-upload the document."
         )
-    print(f"✅ File verified in storage: {file_key}")
     
     # Determine if this is a supplementary upload (added after the application was approved)
     is_supplementary = supplier["status"] == SupplierStatus.APPROVED.value
@@ -212,6 +202,7 @@ async def confirm_upload(
     # Try inserting with supplementary columns first; if the migration hasn't been
     # applied yet those columns won't exist — fall back gracefully so uploads still work.
     document = None
+    reused_existing_document = False
     try:
         document = await db.create_document(document_data)
     except Exception as e:
@@ -242,12 +233,60 @@ async def confirm_upload(
                     ),
                 )
 
+        duplicate_error = (
+            "unique_document_per_supplier" in err_text
+            or (
+                "duplicate key value" in err_text
+                and "(supplier_id, document_type)" in err_text
+            )
+        )
+        if duplicate_error:
+            # Backward-compatibility path for databases that still enforce
+            # one row per (supplier_id, document_type).
+            existing_docs = await db.get_documents_by_supplier(request.supplier_id)
+            existing_doc = next(
+                (doc for doc in existing_docs if doc.get("document_type") == request.document_type.value),
+                None,
+            )
+            if not existing_doc:
+                raise
+
+            replacement_data = {
+                "s3_key": file_key,
+                "file_name": request.filename,
+                "file_size": request.file_size,
+                "content_type": request.content_type,
+                "verification_status": DocumentVerificationStatus.PENDING.value,
+                "uploaded_at": now_utc.isoformat(),
+                "expiry_date": request.expiry_date.isoformat() if request.expiry_date else None,
+                "is_supplementary": is_supplementary,
+                "added_post_approval_at": now_utc.isoformat() if is_supplementary else None,
+            }
+
+            try:
+                document = await db.update_document(existing_doc["id"], replacement_data)
+            except Exception as update_err:
+                update_err_text = str(update_err).lower()
+                update_col_error = any(
+                    kw in update_err_text for kw in ("is_supplementary", "added_post_approval_at", "column")
+                )
+                if update_col_error:
+                    fallback_update_data = {
+                        k: v
+                        for k, v in replacement_data.items()
+                        if k not in ("is_supplementary", "added_post_approval_at")
+                    }
+                    document = await db.update_document(existing_doc["id"], fallback_update_data)
+                else:
+                    raise
+
+            reused_existing_document = True
         col_error = any(kw in str(e).lower() for kw in ("is_supplementary", "added_post_approval_at", "column"))
-        if col_error:
-            print(f"⚠️  Supplementary columns not found in DB — falling back to base insert. Run migration 024. Error: {e}")
+        if col_error and not reused_existing_document:
+            logger.warning("Supplementary columns not found in DB — falling back to base insert. Run migration 024. Error: %s", e)
             fallback_data = {k: v for k, v in document_data.items() if k not in ("is_supplementary", "added_post_approval_at")}
             document = await db.create_document(fallback_data)
-        else:
+        elif not reused_existing_document:
             raise
 
     if not document:
@@ -258,19 +297,20 @@ async def confirm_upload(
 
     # Archive any previous (non-archived) documents of the same type for this supplier.
     # This replaces the old hard-delete and keeps a full audit trail.
-    try:
-        db.client.rpc(
-            "archive_old_document_version",
-            {
-                "p_supplier_id": str(request.supplier_id),
-                "p_document_type": request.document_type.value,
-                "p_new_doc_id": document["id"],
-            }
-        ).execute()
-    except Exception as _archive_err:
-        # Non-fatal: log but don't fail the request (old records stay active until
-        # the migration is applied).
-        print(f"⚠️  archive_old_document_version skipped: {_archive_err}")
+    if not reused_existing_document:
+        try:
+            db.client.rpc(
+                "archive_old_document_version",
+                {
+                    "p_supplier_id": str(request.supplier_id),
+                    "p_document_type": request.document_type.value,
+                    "p_new_doc_id": document["id"],
+                }
+            ).execute()
+        except Exception as _archive_err:
+            # Non-fatal: log but don't fail the request (old records stay active until
+            # the migration is applied).
+            logger.warning("archive_old_document_version skipped: %s", _archive_err)
 
     # Do not auto-restore here. Restoration should occur only after admin verifies
     # the replacement document (handled in admin document verification flow).
@@ -336,7 +376,7 @@ async def confirm_upload(
                 
                 await notification_service.create_bulk_notifications(bulk_notification)
         except Exception as e:
-            print(f"Failed to send document upload notifications: {e}")
+            logger.warning("Failed to send document upload notifications: %s", e)
     
     asyncio.create_task(notify_admins_of_upload())
     
@@ -640,7 +680,7 @@ async def delete_document(
     try:
         storage_service.delete_file(document["s3_key"])
     except Exception as e:
-        print(f"Failed to delete file from S3: {e}")
+        logger.warning("Failed to delete file from S3: %s", e)
         # Continue anyway to clean up database
     
     # Delete from database

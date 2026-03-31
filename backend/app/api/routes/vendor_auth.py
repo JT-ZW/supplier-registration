@@ -5,10 +5,9 @@ Vendor authentication endpoints for supplier portal access.
 from datetime import datetime, timedelta
 from typing import Optional, List
 from fastapi import APIRouter, HTTPException, status, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr, Field, model_validator
+from jose import JWTError, jwt as jose_jwt
 import secrets
-import jwt
 
 from app.core.security import hash_password, verify_password
 from app.core.config import settings
@@ -18,9 +17,9 @@ from app.core.cache_invalidation import invalidate_analytics_cache
 from app.services.audit import audit_service
 from app.models.audit import AuditAction, AuditResourceType
 from app.models import BusinessCategory, Gender, KeyPersonRole, compute_business_size, compute_esg_flags
+from app.api.deps import get_current_vendor  # noqa: E402 — imported after router models
 
 router = APIRouter(prefix="/vendor", tags=["vendor-auth"])
-security = HTTPBearer()
 
 
 # ============== Request/Response Models ==============
@@ -104,6 +103,7 @@ async def _build_registration_draft_response(supplier_id: str) -> dict:
     categories = await db.get_supplier_categories(supplier_id)
     key_persons = await db.get_key_persons_by_supplier(supplier_id)
     trade_refs = await db.get_trade_references_by_supplier(supplier_id)
+    farmer_form = await db.get_farmer_form(supplier_id)
 
     business_categories = [item["category"] for item in categories] if categories else [supplier.get("business_category")]
 
@@ -162,6 +162,27 @@ async def _build_registration_draft_response(supplier_id: str) -> dict:
             }
             for reference in trade_refs
         ],
+        "farmerForm": (
+            {
+                "contactFullName": farmer_form.get("contact_full_name") or "",
+                "idNumber": farmer_form.get("id_number") or "",
+                "gender": farmer_form.get("gender") or "",
+                "dateOfBirth": farmer_form.get("date_of_birth"),
+                "farmingActivity": farmer_form.get("farming_activity") or "",
+                "produceTypes": farmer_form.get("produce_types") or "",
+                "estimatedLandSizeHa": farmer_form.get("estimated_land_size_ha"),
+                "yearsFarming": farmer_form.get("years_farming"),
+                "landProofType": farmer_form.get("land_proof_type") or "",
+                "villageOrFarmName": farmer_form.get("village_or_farm_name") or "",
+                "district": farmer_form.get("district") or "",
+                "province": farmer_form.get("province") or "",
+                "contactPhone": farmer_form.get("contact_phone") or "",
+                "hasBankAccount": bool(farmer_form.get("has_bank_account")),
+                "bankName": farmer_form.get("bank_name") or "",
+            }
+            if farmer_form
+            else None
+        ),
         "updatedAt": supplier.get("updated_at") or supplier.get("created_at"),
     }
 
@@ -169,72 +190,37 @@ async def _build_registration_draft_response(supplier_id: str) -> dict:
 # ============== Helper Functions ==============
 
 def create_vendor_access_token(supplier_id: str, email: str) -> str:
-    """Create JWT access token for vendor."""
+    """Create a vendor JWT access token using python-jose (same library as admin tokens)."""
+    expire = datetime.utcnow() + timedelta(days=settings.VENDOR_JWT_EXPIRE_DAYS)
     payload = {
         "sub": supplier_id,
         "email": email,
         "type": "access",
         "role": "vendor",
-        "exp": datetime.utcnow() + timedelta(days=7)  # 7-day expiry
+        "exp": expire,
+        "iat": datetime.utcnow(),
     }
-    token = jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm="HS256")
-    return token
+    return jose_jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
 def decode_vendor_token(token: str) -> dict:
-    """Decode and validate vendor JWT token."""
+    """Decode and validate a vendor JWT token using python-jose."""
     try:
-        payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=["HS256"])
-        if payload.get("type") != "access":
-            print(f"Token type mismatch: {payload.get('type')}")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token type"
-            )
-        # Verify it's a vendor token
-        if payload.get("role") != "vendor":
-            print(f"Token role mismatch: {payload.get('role')}")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token role"
-            )
-        return payload
-    except jwt.ExpiredSignatureError:
-        print("Token expired")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token has expired"
+        payload = jose_jwt.decode(
+            token,
+            settings.JWT_SECRET_KEY,
+            algorithms=[settings.JWT_ALGORITHM],
         )
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Token decode error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token"
-        )
+    except JWTError as exc:
+        # ExpiredSignatureError is a subclass of JWTError in python-jose
+        detail = "Token has expired" if "expired" in str(exc).lower() else "Invalid token"
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=detail)
 
-
-async def get_current_vendor(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
-    """Get currently authenticated vendor from token."""
-    token = credentials.credentials
-    payload = decode_vendor_token(token)
-    
-    result = db._client.table("suppliers").select("*").eq("id", payload["sub"]).execute()
-    
-    if not result.data:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Supplier not found"
-        )
-    
-    supplier = result.data[0]
-    # Remove sensitive data
-    supplier.pop("password_hash", None)
-    supplier.pop("password_reset_token", None)
-    supplier.pop("password_reset_expires", None)
-    
-    return supplier
+    if payload.get("type") != "access":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token type")
+    if payload.get("role") != "vendor":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token role")
+    return payload
 
 
 # ============== Endpoints ==============
@@ -307,6 +293,8 @@ async def vendor_signup(request: VendorSignupRequest):
         resource_name=supplier.get("company_name", "PENDING_VENDOR"),
         metadata={"email": request.email}
     )
+
+    access_token = create_vendor_access_token(supplier["id"], supplier["email"])
 
     
     # Remove sensitive data
@@ -598,7 +586,16 @@ async def save_registration_draft(
         }
         for person in request.keyPersons
     ]
-    esg_flags = compute_esg_flags(key_persons_payload)
+
+    # Draft saves happen while users are still typing. Persist only valid records to avoid DB constraint failures.
+    persistable_key_persons = [
+        person
+        for person in key_persons_payload
+        if (person.get("full_name") or "").strip()
+        and person.get("date_of_birth")
+    ]
+
+    esg_flags = compute_esg_flags(persistable_key_persons)
     business_size = compute_business_size(request.employeeCount)
 
     supplier_update = {
@@ -636,7 +633,7 @@ async def save_registration_draft(
         )
 
     await db.delete_key_persons_by_supplier(supplier_id)
-    for person in key_persons_payload:
+    for person in persistable_key_persons:
         await db.create_key_person(
             {
                 "supplier_id": supplier_id,
@@ -649,14 +646,31 @@ async def save_registration_draft(
 
     await db.delete_trade_references_by_supplier(supplier_id)
     for reference in request.tradeReferences:
+        company_name = (reference.companyName or "").strip()
+        contact_person_name = (reference.contactPersonName or "").strip()
+        email = (str(reference.email) if reference.email is not None else "").strip()
+        phone = (reference.phone or "").strip()
+        relationship = (reference.relationship or "").strip()
+        has_minimum_reference_data = (
+            len(company_name) >= 2
+            and len(contact_person_name) >= 2
+            and len(email) > 0
+            and len(phone) >= 7
+            and len(relationship) >= 2
+            and bool(reference.permissionGranted)
+        )
+
+        if not has_minimum_reference_data:
+            continue
+
         await db.create_trade_reference(
             {
                 "supplier_id": supplier_id,
-                "company_name": reference.companyName,
-                "contact_person_name": reference.contactPersonName,
-                "email": str(reference.email),
-                "phone": reference.phone,
-                "relationship": reference.relationship,
+                "company_name": company_name,
+                "contact_person_name": contact_person_name,
+                "email": email,
+                "phone": phone,
+                "relationship": relationship,
                 "service_product": reference.serviceProduct,
                 "contract_start_date": reference.contractStartDate,
                 "contract_end_date": reference.contractEndDate,
@@ -833,13 +847,11 @@ async def update_vendor_profile_alias(update_data: dict, current_vendor: dict = 
 
 
 @router.post("/submit-application")
-async def submit_application(credentials: HTTPAuthorizationCredentials = Depends(security)):
+async def submit_application(vendor: dict = Depends(get_current_vendor)):
     """
     Submit vendor application for review.
     Changes status from INCOMPLETE to SUBMITTED and sets submitted_at timestamp.
     """
-    vendor = await get_current_vendor(credentials)
-    
     # Check if already submitted
     if vendor["status"] != "INCOMPLETE":
         raise HTTPException(
@@ -934,7 +946,14 @@ async def submit_application(credentials: HTTPAuthorizationCredentials = Depends
         print(f"Failed to send vendor confirmation email: {str(e)}")
 
     await invalidate_analytics_cache()
-    
+
+    # Compute initial per-category compliance levels now that docs are attached.
+    try:
+        from app.db.supabase import db as _db
+        await _db.recompute_supplier_category_compliance(vendor["id"])
+    except Exception as _ce:
+        print(f"⚠️  compliance recompute skipped on submission for {vendor['id']}: {_ce}")
+
     updated_supplier.pop("password_hash", None)
     updated_supplier.pop("password_reset_token", None)
     updated_supplier.pop("password_reset_expires", None)

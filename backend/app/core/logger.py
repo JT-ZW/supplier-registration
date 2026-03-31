@@ -5,9 +5,9 @@ Replaces print() statements with proper logging.
 
 import logging
 import sys
-from datetime import datetime
 from typing import Any, Dict, Optional
 from pathlib import Path
+from logging.handlers import TimedRotatingFileHandler
 
 # Create logs directory if it doesn't exist
 log_dir = Path("logs")
@@ -26,16 +26,22 @@ console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(console_formatter)
 console_handler.setLevel(logging.INFO)
 
-# File handler for all logs
-file_handler = logging.FileHandler(
-    log_dir / f"app_{datetime.now().strftime('%Y%m%d')}.log"
+# File handler for all logs — rotates at midnight, keeps 14 days
+file_handler = TimedRotatingFileHandler(
+    log_dir / "app.log",
+    when="midnight",
+    backupCount=14,
+    encoding="utf-8",
 )
 file_handler.setFormatter(file_formatter)
 file_handler.setLevel(logging.DEBUG)
 
-# File handler for errors only
-error_handler = logging.FileHandler(
-    log_dir / f"errors_{datetime.now().strftime('%Y%m%d')}.log"
+# File handler for errors only — rotates at midnight, keeps 14 days
+error_handler = TimedRotatingFileHandler(
+    log_dir / "errors.log",
+    when="midnight",
+    backupCount=14,
+    encoding="utf-8",
 )
 error_handler.setFormatter(file_formatter)
 error_handler.setLevel(logging.ERROR)

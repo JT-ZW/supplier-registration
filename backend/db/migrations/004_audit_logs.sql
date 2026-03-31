@@ -3,14 +3,9 @@
 -- Run Date: 2026-01-26
 
 -- ============================================
--- Drop existing table if needed (for clean migration)
--- ============================================
-DROP TABLE IF EXISTS audit_logs CASCADE;
-
--- ============================================
 -- Audit Logs Table
 -- ============================================
-CREATE TABLE audit_logs (
+CREATE TABLE IF NOT EXISTS audit_logs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     
     -- User information (separate columns for admin vs supplier)
@@ -48,29 +43,29 @@ CREATE TABLE audit_logs (
 -- ============================================
 
 -- Index for user activity lookups
-CREATE INDEX idx_audit_logs_admin_id ON audit_logs(admin_id);
-CREATE INDEX idx_audit_logs_supplier_id ON audit_logs(supplier_id);
-CREATE INDEX idx_audit_logs_user_type ON audit_logs(user_type);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_admin_id ON audit_logs(admin_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_supplier_id ON audit_logs(supplier_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_user_type ON audit_logs(user_type);
 
 -- Index for resource tracking
-CREATE INDEX idx_audit_logs_resource_type ON audit_logs(resource_type);
-CREATE INDEX idx_audit_logs_resource_id ON audit_logs(resource_id);
-CREATE INDEX idx_audit_logs_resource_type_id ON audit_logs(resource_type, resource_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_resource_type ON audit_logs(resource_type);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_resource_id ON audit_logs(resource_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_resource_type_id ON audit_logs(resource_type, resource_id);
 
 -- Index for action filtering
-CREATE INDEX idx_audit_logs_action ON audit_logs(action);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action);
 
 -- Index for time-based queries (most common)
-CREATE INDEX idx_audit_logs_created_at ON audit_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);
 
 -- Composite indexes for common query patterns
-CREATE INDEX idx_audit_logs_admin_created ON audit_logs(admin_id, created_at DESC);
-CREATE INDEX idx_audit_logs_supplier_created ON audit_logs(supplier_id, created_at DESC);
-CREATE INDEX idx_audit_logs_resource_created ON audit_logs(resource_type, resource_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_admin_created ON audit_logs(admin_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_supplier_created ON audit_logs(supplier_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_resource_created ON audit_logs(resource_type, resource_id, created_at DESC);
 
 -- GIN index for JSONB columns (for searching within changes/metadata)
-CREATE INDEX idx_audit_logs_changes ON audit_logs USING GIN (changes);
-CREATE INDEX idx_audit_logs_metadata ON audit_logs USING GIN (metadata);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_changes ON audit_logs USING GIN (changes);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_metadata ON audit_logs USING GIN (metadata);
 
 -- ============================================
 -- Helper Functions

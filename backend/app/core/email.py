@@ -5,6 +5,8 @@ Email notification service using SendGrid or SMTP.
 from typing import Optional, Dict, Any, List
 from enum import Enum
 import asyncio
+import re
+from html import escape
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail, Email, To, Content
 import aiosmtplib
@@ -12,6 +14,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 from .config import settings
+from .logger import logger
 
 
 class EmailTemplate(str, Enum):
@@ -49,6 +52,25 @@ class EmailService:
         if self._use_sendgrid:
             self._sendgrid_client = SendGridAPIClient(settings.SENDGRID_API_KEY)
     
+    def _render_template(self, template_str: str, data: Dict[str, Any]) -> str:
+        """
+        Safely substitute {key} placeholders in a template string.
+
+        User-supplied string values are HTML-escaped before insertion so that
+        special characters cannot inject markup.  The substitution is done via
+        re.sub (single-pass) which prevents secondary format-string expansion
+        (i.e. a value of '{other_key}' is inserted verbatim, not re-expanded).
+        """
+        def _escape(v: Any) -> str:
+            return escape(str(v)) if isinstance(v, str) else str(v)
+
+        safe_data = {k: _escape(v) for k, v in data.items()}
+        return re.sub(
+            r"\{(\w+)\}",
+            lambda m: safe_data.get(m.group(1), m.group(0)),
+            template_str,
+        )
+
     def _get_template_content(
         self,
         template: EmailTemplate,
@@ -391,9 +413,9 @@ class EmailService:
             "body": "<p>You have a new notification.</p>"
         })
         
-        # Interpolate data into template
-        subject = template_data["subject"].format(**data)
-        body = template_data["body"].format(**data)
+        # Render placeholders safely (HTML-escaped, no secondary expansion)
+        subject = self._render_template(template_data["subject"], data)
+        body = self._render_template(template_data["body"], data)
         
         return {"subject": subject, "body": body}
     
@@ -446,7 +468,7 @@ class EmailService:
             return True
             
         except Exception as e:
-            print(f"SendGrid email error: {str(e)}")
+            logger.error("SendGrid email error: %s", e)
             return False
     
     async def _send_via_smtp(
@@ -477,7 +499,7 @@ class EmailService:
             return True
             
         except Exception as e:
-            print(f"SMTP email error: {str(e)}")
+            logger.error("SMTP email error: %s", e)
             return False
     
     async def send_template_email(

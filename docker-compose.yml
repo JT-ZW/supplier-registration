@@ -15,8 +15,6 @@ services:
       - ./backend/.env
     environment:
       # Override any env vars from .env file if needed
-      - APP_ENV=development
-      - DEBUG=true
       - FRONTEND_URL=http://localhost:3000
     
     volumes:
